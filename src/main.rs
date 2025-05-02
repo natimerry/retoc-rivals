@@ -48,10 +48,12 @@ use std::{
     str::FromStr,
     sync::{Arc, Mutex},
 };
+use std::fs::File;
 use strum::{AsRefStr, FromRepr};
 use tracing::instrument;
 use version::EngineVersion;
 use zen_asset_conversion::ConvertedZenAssetBundle;
+
 
 #[derive(Parser, Debug)]
 struct ActionManifest {
@@ -244,7 +246,7 @@ enum Action {
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(short, long)]
+    #[arg(short, long,default_value="0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74")]
     aes_key: Option<String>,
     #[arg(long)]
     override_container_header_version: Option<EIoContainerHeaderVersion>,
@@ -259,13 +261,15 @@ fn main() -> Result<()> {
         container_header_version_override: args.override_container_header_version,
         ..Default::default()
     };
-    if let Some(aes) = args.aes_key {
+    println!("Using aes key: {:?}",&args.aes_key);
+    if let Some(aes) = args.aes_key.clone() {
         config
             .aes_keys
             .insert(FGuid::default(), AesKey::from_str(&aes)?);
     }
     let config = Arc::new(config);
 
+    let aes = AesKey::from_str(&args.aes_key.unwrap().clone()).unwrap().0;
     match args.action {
         Action::Manifest(action) => action_manifest(action, config),
         Action::Info(action) => action_info(action, config),
@@ -277,7 +281,7 @@ fn main() -> Result<()> {
         Action::PackRaw(action) => action_pack_raw(action, config),
 
         Action::ToLegacy(action) => action_to_legacy(action, config),
-        Action::ToZen(action) => action_to_zen(action, config),
+        Action::ToZen(action) => action_to_zen(action, config,aes),
 
         Action::Get(action) => action_get(action, config),
 
@@ -948,7 +952,7 @@ fn action_to_legacy_shaders(
     Ok(())
 }
 
-fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
+fn action_to_zen(args: ActionToZen, config: Arc<Config>, aes_key: aes::Aes256) -> Result<()> {
     let mount_point = UEPath::new("../../../");
 
     let input: Box<dyn FileReaderTrait> = if args.input.is_dir() {
@@ -1150,14 +1154,26 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     // create empty pak file if one does not already exist (necessary for game to detect and load container)
     let pak_path = Path::new(&args.output).with_extension("pak");
     if !pak_path.exists() {
-        repak::PakBuilder::new()
-            .writer(
-                &mut BufWriter::new(fs::File::create(pak_path)?),
-                repak::Version::V11,
-                mount_point.to_string(),
-                None,
-            )
-            .write_index()?;
+        let path_file = File::create(pak_path).unwrap();
+
+        let builder = repak::PakBuilder::new()
+            .key(aes_key);
+        let mut pak_writer = builder.writer(
+            BufWriter::new(path_file),
+            Version::V11,
+            mount_point.to_string(),
+            None
+        );
+        let entry_builder = pak_writer.entry_builder();
+        let dummy_data = b"created_by_repak".to_vec();
+        let path = "dummy";
+        let entry = entry_builder
+            .build_entry(true, dummy_data, "dummy")
+            .expect("Failed to build entry");
+
+        println!("Writing: {}", path);
+        pak_writer.write_entry((&path).to_string(), entry)?;
+
     }
 
     Ok(())
@@ -2521,7 +2537,10 @@ use crate::shader_library::{
 };
 use crate::zen::FPackageFileVersion;
 use directory_index::*;
+use repak::Error::Aes;
+use repak::Version;
 use zen::get_package_name;
+use crate::compression::CompressionMethod::Oodle;
 
 mod directory_index {
     use typed_path::Utf8Component as _;
