@@ -653,8 +653,10 @@ struct ParallelPakWriter {
     tx: std::sync::mpsc::SyncSender<(String, repak::PartialEntry<Vec<u8>>)>,
 }
 impl FileWriterTrait for ParallelPakWriter {
+    // TODO: pass in relative path to this argument
     fn write_file(&self, path: String, allow_compress: bool, data: Vec<u8>) -> Result<()> {
-        let entry = self.entry_builder.build_entry(allow_compress, data)?;
+
+        let entry = self.entry_builder.build_entry(allow_compress, data,&path)?;
         self.tx.send((path, entry))?;
         Ok(())
     }
