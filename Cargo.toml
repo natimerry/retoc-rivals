@@ -2,8 +2,6 @@
 name = "retoc"
 edition = "2021"
 
-[workspace]
-
 [profile.release]
 debug = true
 

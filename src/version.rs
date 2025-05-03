@@ -7,7 +7,7 @@ use crate::{
 use EngineVersion::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 #[clap(rename_all = "verbatim")]
-pub(crate) enum EngineVersion {
+pub enum EngineVersion {
     UE4_26,
     UE4_27,
     UE5_0,

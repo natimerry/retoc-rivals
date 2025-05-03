@@ -298,7 +298,7 @@ impl FIoContainerHeader {
 )]
 #[repr(i32)]
 #[clap(rename_all = "verbatim")]
-pub(crate) enum EIoContainerHeaderVersion {
+pub enum EIoContainerHeaderVersion {
     PreInitial = -1,
     Initial = 0,
     LocalizedPackages = 1,

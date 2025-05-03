@@ -51,7 +51,7 @@ use std::{
 use std::fs::File;
 use strum::{AsRefStr, FromRepr};
 use tracing::instrument;
-use version::EngineVersion;
+pub use version::EngineVersion;
 use zen_asset_conversion::ConvertedZenAssetBundle;
 
 
@@ -163,7 +163,7 @@ struct ActionToLegacy {
 }
 
 #[derive(Parser, Debug)]
-struct ActionToZen {
+pub struct ActionToZen {
     /// Input directory or .pak
     #[arg(index = 1)]
     input: PathBuf,
@@ -188,6 +188,20 @@ struct ActionToZen {
     /// Do not run in parallel. Useful for debugging
     #[arg(long)]
     no_parallel: bool,
+}
+
+impl ActionToZen{
+    pub fn new(input: PathBuf, output: PathBuf, version: EngineVersion) -> Self {
+        Self {
+            input,
+            output,
+            filter: vec![],
+            version,
+            verbose: false,
+            debug: false,
+            no_parallel: false,
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -281,7 +295,7 @@ fn main() -> Result<()> {
         Action::PackRaw(action) => action_pack_raw(action, config),
 
         Action::ToLegacy(action) => action_to_legacy(action, config),
-        Action::ToZen(action) => action_to_zen(action, config,aes),
+        Action::ToZen(action) => action_to_zen(action, config),
 
         Action::Get(action) => action_get(action, config),
 
@@ -952,7 +966,7 @@ fn action_to_legacy_shaders(
     Ok(())
 }
 
-fn action_to_zen(args: ActionToZen, config: Arc<Config>, aes_key: aes::Aes256) -> Result<()> {
+pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     let mount_point = UEPath::new("../../../");
 
     let input: Box<dyn FileReaderTrait> = if args.input.is_dir() {
@@ -1239,13 +1253,13 @@ fn read_file_opt<P: AsRef<Path>>(path: P) -> Result<Option<Vec<u8>>> {
 }
 
 #[derive(Default)]
-struct Config {
-    aes_keys: HashMap<FGuid, AesKey>,
-    container_header_version_override: Option<EIoContainerHeaderVersion>,
+pub struct Config {
+    pub aes_keys: HashMap<FGuid, AesKey>,
+    pub container_header_version_override: Option<EIoContainerHeaderVersion>,
 }
 
 #[derive(Debug, Clone)]
-struct AesKey(aes::Aes256);
+pub struct AesKey(aes::Aes256);
 impl std::str::FromStr for AesKey {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -2242,7 +2256,7 @@ impl Writeable for FIoStoreTocEntryMeta {
     }
 }
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct FGuid {
+pub struct FGuid {
     a: u32,
     b: u32,
     c: u32,
