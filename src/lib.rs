@@ -48,7 +48,6 @@ use std::{
     str::FromStr,
     sync::{Arc, Mutex},
 };
-use std::fs::File;
 use strum::{AsRefStr, FromRepr};
 use tracing::instrument;
 pub use version::EngineVersion;
@@ -2528,10 +2527,7 @@ use crate::shader_library::{
 };
 use crate::zen::FPackageFileVersion;
 use directory_index::*;
-use repak::Error::Aes;
-use repak::Version;
 use zen::get_package_name;
-use crate::compression::CompressionMethod::Oodle;
 
 mod directory_index {
     use typed_path::Utf8Component as _;
