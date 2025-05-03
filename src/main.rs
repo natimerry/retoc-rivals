@@ -1151,30 +1151,7 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>, aes_key: aes::Aes256) -
 
     writer.finalize()?;
 
-    // create empty pak file if one does not already exist (necessary for game to detect and load container)
-    let pak_path = Path::new(&args.output).with_extension("pak");
-    if !pak_path.exists() {
-        let path_file = File::create(pak_path).unwrap();
-
-        let builder = repak::PakBuilder::new()
-            .key(aes_key);
-        let mut pak_writer = builder.writer(
-            BufWriter::new(path_file),
-            Version::V11,
-            mount_point.to_string(),
-            None
-        );
-        let entry_builder = pak_writer.entry_builder();
-        let dummy_data = b"created_by_repak".to_vec();
-        let path = "dummy";
-        let entry = entry_builder
-            .build_entry(true, dummy_data, "dummy")
-            .expect("Failed to build entry");
-
-        println!("Writing: {}", path);
-        pak_writer.write_entry((&path).to_string(), entry)?;
-
-    }
+    println!("Skipping writing pak file as repak is responsible for generating the pak file");
 
     Ok(())
 }
