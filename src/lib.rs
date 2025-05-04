@@ -55,9 +55,15 @@ use zen_asset_conversion::ConvertedZenAssetBundle;
 
 
 #[derive(Parser, Debug)]
-struct ActionManifest {
+pub struct ActionManifest {
     #[arg(index = 1)]
-    utoc: PathBuf,
+    pub utoc: PathBuf,
+}
+
+impl ActionManifest {
+    pub fn new(utoc: PathBuf) -> Self {
+        Self { utoc }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -284,7 +290,7 @@ fn main() -> Result<()> {
 
     let aes = AesKey::from_str(&args.aes_key.unwrap().clone()).unwrap().0;
     match args.action {
-        Action::Manifest(action) => action_manifest(action, config),
+        Action::Manifest(action) => { action_manifest(action, config); Ok(()) },
         Action::Info(action) => action_info(action, config),
         Action::List(action) => action_list(action, config),
         Action::Verify(action) => action_verify(action, config),
@@ -302,7 +308,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn action_manifest(args: ActionManifest, config: Arc<Config>) -> Result<()> {
+pub fn action_manifest(args: ActionManifest, config: Arc<Config>) -> Result<(PackageStoreManifest)> {
     let iostore = iostore::open(args.utoc, config)?;
 
     let entries = Arc::new(Mutex::new(vec![]));
@@ -363,12 +369,8 @@ fn action_manifest(args: ActionManifest, config: Arc<Config>) -> Result<()> {
         oplog: manifest::OpLog { entries },
     };
 
-    let path = "pakstore.json";
-    fs::write(path, serde_json::to_vec(&manifest)?)?;
 
-    println!("wrote {} entries to {}", manifest.oplog.entries.len(), path);
-
-    Ok(())
+    return Ok((manifest));
 }
 
 fn action_info(args: ActionInfo, config: Arc<Config>) -> Result<()> {
@@ -2528,6 +2530,7 @@ use crate::shader_library::{
 use crate::zen::FPackageFileVersion;
 use directory_index::*;
 use zen::get_package_name;
+use crate::manifest::PackageStoreManifest;
 
 mod directory_index {
     use typed_path::Utf8Component as _;
