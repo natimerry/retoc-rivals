@@ -229,8 +229,6 @@ fn setup_zen_package_summary(
                     })
                     .collect()
             } else {
-                println!("Writing data for invalid entry...");
-
                 vec![FBulkDataMapEntry {
                     serial_offset: 0,
                     duplicate_serial_offset: -1,
