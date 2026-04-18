@@ -40,7 +40,7 @@ pub fn compress<S: Write>(
         CompressionMethod::Oodle => {
             let buffer = oodle_loader::oodle()?.compress(
                 input,
-                oodle_loader::Compressor::Mermaid,
+                oodle_loader::Compressor::Kraken,
                 oodle_loader::CompressionLevel::Normal,
             )?;
             output.write_all(&buffer)?;
