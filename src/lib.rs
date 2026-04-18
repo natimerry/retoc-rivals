@@ -198,9 +198,15 @@ pub struct ActionToZen {
     /// Do not run in parallel. Useful for debugging
     #[arg(long)]
     no_parallel: bool,
+    pub obfuscate: bool,
 }
 
 impl ActionToZen {
+    pub fn with_obfuscation(mut self, obfuscate: bool) -> Self {
+        self.obfuscate = obfuscate;
+        self
+    }
+
     pub fn new(input: PathBuf, output: PathBuf, version: EngineVersion) -> Self {
         Self {
             input,
@@ -210,6 +216,7 @@ impl ActionToZen {
             verbose: false,
             debug: false,
             no_parallel: false,
+            obfuscate: false,
         }
     }
 }
@@ -1107,6 +1114,7 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     // Decide whenever we need all packages to be in memory at the same time to perform the fixup or not
     let needs_asset_import_fixup = container_header_version <= EIoContainerHeaderVersion::Initial;
 
+    writer.set_obfuscated(args.obfuscate);
     let process_assets = |tx: std::sync::mpsc::SyncSender<ConvertedZenAssetBundle>| -> Result<()> {
         let process = |path: &&UEPathBuf| -> Result<()> {
             verbose!(&log, "converting asset {path:?}");
@@ -1502,7 +1510,9 @@ fn read_directory_index<R: Read>(
         .contains(EIoContainerFlags::Encrypted)
     {
         use aes::cipher::BlockDecrypt;
-
+        if FIoDirectoryIndexResource::de(&mut Cursor::new(buf.clone())).is_ok() {
+            return Ok(buf);
+        }
         let key = config
             .aes_keys
             .get(&header.encryption_key_guid)
@@ -1595,6 +1605,17 @@ struct TocSignatures {
     block_signature: Vec<u8>,
     chunk_block_signatures: Vec<FSHAHash>,
 }
+
+impl Toc {
+    pub(crate) fn set_obfuscated(&mut self, obfuscated: bool) {
+        if obfuscated {
+            self.container_flags |= EIoContainerFlags::Encrypted;
+            self.encryption_key_guid = Default::default();
+        } else {
+            self.container_flags.remove(EIoContainerFlags::Encrypted);
+        }
+    }
+}
 impl Readable for Toc {
     fn de<S: Read>(stream: &mut S) -> Result<Self> {
         stream.de_ctx(Arc::new(Config::default()))
@@ -1671,7 +1692,8 @@ impl ReadableCtx<Arc<Config>> for Toc {
 }
 impl Writeable for Toc {
     fn ser<S: Write>(&self, s: &mut S) -> Result<()> {
-        let mut container_flags = EIoContainerFlags::empty();
+        let mut container_flags = EIoContainerFlags::from_bits_retain(self.container_flags.bits());
+        // let mut container_flags = EIoContainerFlags::empty();
 
         container_flags |= EIoContainerFlags::Indexed;
         let mut directory_index_buffer = vec![];
@@ -1695,7 +1717,7 @@ impl Writeable for Toc {
             directory_index_size: directory_index_buffer.len() as u32,
             partition_count: 1,
             container_id: self.container_id,
-            encryption_key_guid: Default::default(),
+            encryption_key_guid: self.encryption_key_guid,
             container_flags,
             reserved3: 0,
             reserved4: 0,

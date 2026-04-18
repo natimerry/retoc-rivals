@@ -25,6 +25,10 @@ pub(crate) struct IoStoreWriter {
 }
 
 impl IoStoreWriter {
+    pub(crate) fn set_obfuscated(&mut self, obfuscated: bool) {
+        self.toc.set_obfuscated(obfuscated);
+    }
+
     pub(crate) fn new<P: AsRef<Path>>(
         toc_path: P,
         toc_version: EIoStoreTocVersion,
