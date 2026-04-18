@@ -132,44 +132,44 @@ struct ActionPackRaw {
 }
 
 #[derive(Parser, Debug)]
-struct ActionToLegacy {
+pub struct ActionToLegacy {
     /// Input .utoc or directory with multiple .utoc (e.g. Content/Paks/)
     #[arg(index = 1)]
-    input: PathBuf,
+    pub input: PathBuf,
     /// Output directory or .pak
     #[arg(index = 2)]
-    output: PathBuf,
+    pub output: PathBuf,
 
     /// Asset file name filter
     #[arg(short, long)]
-    filter: Vec<String>,
+    pub filter: Vec<String>,
 
     /// Skip conversion of assets
     #[arg(long)]
-    no_assets: bool,
+    pub no_assets: bool,
     /// Skip conversion of shader libraries
     #[arg(long)]
-    no_shaders: bool,
+    pub no_shaders: bool,
     /// Skip compression of shader libraries
     #[arg(long)]
-    no_compres_shaders: bool,
+    pub no_compres_shaders: bool,
     /// Do not output any files (dry run). Useful for testing conversion
     #[arg(short, long)]
-    dry_run: bool,
+    pub dry_run: bool,
 
     /// Engine version override
     #[arg(long)]
-    version: Option<EngineVersion>,
+    pub version: Option<EngineVersion>,
 
     /// Verbose logging
     #[arg(short, long)]
-    verbose: bool,
+    pub verbose: bool,
     /// Debug logging
     #[arg(long)]
-    debug: bool,
+    pub debug: bool,
     /// Do not run in parallel. Useful for debugging
     #[arg(long)]
-    no_parallel: bool,
+    pub no_parallel: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -602,7 +602,36 @@ mod raw {
         })
     }
 }
+pub fn extract_package_exports(utoc: &Path, config: Arc<Config>, output: &Path) -> Result<()> {
+    let iostore = iostore::open(utoc, config.clone())?;
+    let log = Log::new(false, false);
+    let package_context = FZenPackageContext::create(&*iostore, None, &log);
 
+    let file_writer = FSFileWriter::new(output);
+
+    for package_info in iostore.packages() {
+        let chunk_id =
+            FIoChunkId::from_package_id(package_info.id(), 0, EIoChunkType::ExportBundleData);
+        let package_path = match iostore.chunk_path(chunk_id) {
+            Some(p) => p,
+            None => continue,
+        };
+        let path = package_path
+            .strip_prefix("../../../")
+            .unwrap_or(&package_path);
+
+        // best effort - skip packages that fail
+        if let Err(e) = asset_conversion::build_legacy(
+            &package_context,
+            package_info.id(),
+            UEPath::new(path),
+            &file_writer,
+        ) {
+            eprintln!("Skipping {path}: {e}");
+        }
+    }
+    Ok(())
+}
 fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
     let iostore = iostore::open(args.utoc, config)?;
 
@@ -781,7 +810,7 @@ impl FileReaderTrait for PakFileReader {
     }
 }
 
-fn action_to_legacy(args: ActionToLegacy, config: Arc<Config>) -> Result<()> {
+pub fn action_to_legacy(args: ActionToLegacy, config: Arc<Config>) -> Result<()> {
     let log = Log::new(args.verbose, args.debug);
     if args.dry_run {
         action_to_legacy_inner(args, config, &NullFileWriter, &log)?;
