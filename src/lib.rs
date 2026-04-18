@@ -58,7 +58,6 @@ pub fn open_iostore<P: AsRef<Path>>(path: P, config: Arc<Config>) -> Result<Box<
     iostore::open(path, config)
 }
 
-
 #[derive(Parser, Debug)]
 pub struct ActionManifest {
     #[arg(index = 1)]
@@ -106,13 +105,13 @@ struct ActionVerify {
 }
 
 #[derive(Parser, Debug)]
-struct ActionUnpack {
+pub struct ActionUnpack {
     #[arg(index = 1)]
-    utoc: PathBuf,
+    pub utoc: PathBuf,
     #[arg(index = 2)]
-    output: PathBuf,
+    pub output: PathBuf,
     #[arg(short, long, default_value = "false")]
-    verbose: bool,
+    pub verbose: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -335,8 +334,8 @@ pub fn action_manifest(
 
     let entries = Arc::new(Mutex::new(vec![]));
 
-    let container_header_version = iostore.container_header_version().unwrap();
-    let toc_version = iostore.container_file_version().unwrap();
+    let container_header_version = iostore.container_header_version().unwrap_or_default();
+    let toc_version = iostore.container_file_version().unwrap_or_default();
 
     iostore
         .packages()
@@ -532,7 +531,7 @@ fn action_verify(args: ActionVerify, config: Arc<Config>) -> Result<()> {
     Ok(())
 }
 
-fn action_unpack(args: ActionUnpack, config: Arc<Config>) -> Result<()> {
+pub fn action_unpack(args: ActionUnpack, config: Arc<Config>) -> Result<()> {
     let mut stream = BufReader::new(fs::File::open(&args.utoc)?);
     let ucas = &args.utoc.with_extension("ucas");
 
