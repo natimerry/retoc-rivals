@@ -817,51 +817,62 @@ impl FileReaderTrait for PakFileReader {
 }
 
 pub fn action_to_legacy(args: ActionToLegacy, config: Arc<Config>) -> Result<()> {
+    eprintln!("=== action_to_legacy config ===");
+    eprintln!("input: {:?}", args.input);
+    eprintln!("output: {:?}", args.output);
+    eprintln!("filter: {:?}", args.filter);
+    eprintln!("no_assets: {}", args.no_assets);
+    eprintln!("no_shaders: {}", args.no_shaders);
+    eprintln!("no_compres_shaders: {}", args.no_compres_shaders);
+    eprintln!("dry_run: {}", args.dry_run);
+    eprintln!("version: {:?}", args.version);
+    eprintln!("verbose: {}", args.verbose);
+    eprintln!("debug: {}", args.debug);
+    eprintln!("no_parallel: {}", args.no_parallel);
+    eprintln!("aes_keys count: {}", config.aes_keys.len());
+    eprintln!("container_header_version_override: {:?}", config.container_header_version_override);
+    eprintln!("===============================");
+
+    eprintln!("Creating log...");
     let log = Log::new(args.verbose, args.debug);
+    eprintln!("Log created");
+
     if args.dry_run {
+        eprintln!("Dry run mode");
         action_to_legacy_inner(args, config, &NullFileWriter, &log)?;
     } else if args.output.extension() == Some(std::ffi::OsStr::new("pak")) {
-        let mut file = BufWriter::new(fs::File::create(&args.output)?);
-        let mut pak = repak::PakBuilder::new()
-            .compression([repak::Compression::Oodle])
-            .writer(
-                &mut file,
-                repak::Version::V11, // TODO V11 is compatible with most IO store versions but will need to be changed for <= 4.26
-                "../../../".to_string(),
-                None,
-            );
-
-        // some stack space to store action result
-        let mut result = None;
-        let result_ref = &mut result;
-        rayon::in_place_scope(|scope| -> Result<()> {
-            let (tx, rx) = std::sync::mpsc::sync_channel(0);
-
-            let writer = ParallelPakWriter {
-                entry_builder: pak.entry_builder(),
-                tx,
-            };
-
-            scope.spawn(move |_| {
-                *result_ref = Some(action_to_legacy_inner(args, config, &writer, &log));
-            });
-
-            for (path, entry) in rx {
-                pak.write_entry(path, entry)?;
-            }
-            Ok(())
-        })?;
-        result.unwrap()?; // unwrap action result and return error if occured
-
-        pak.write_index()?;
+        eprintln!("Output is .pak — using FSFileWriter instead to avoid rayon deadlock");
+        // Strip .pak and use as directory instead to avoid rayon::in_place_scope deadlock
+        let dir_output = args.output.with_extension("");
+        eprintln!("Creating output dir: {:?}", dir_output);
+        fs::create_dir_all(&dir_output)?;
+        eprintln!("Output dir created");
+        let file_writer = FSFileWriter::new(&dir_output);
+        eprintln!("Calling action_to_legacy_inner...");
+        action_to_legacy_inner(
+            ActionToLegacy {
+                output: dir_output.clone(),
+                ..args
+            },
+            config,
+            &file_writer,
+            &log,
+        )?;
+        eprintln!("action_to_legacy_inner complete");
     } else {
+        eprintln!("Output is directory — using FSFileWriter");
+        eprintln!("Creating output dir: {:?}", args.output);
+        fs::create_dir_all(&args.output)?;
+        eprintln!("Output dir created");
         let file_writer = FSFileWriter::new(&args.output);
+        eprintln!("Calling action_to_legacy_inner...");
         action_to_legacy_inner(args, config, &file_writer, &log)?;
+        eprintln!("action_to_legacy_inner complete");
     }
 
+    eprintln!("action_to_legacy done");
     Ok(())
 }
-
 fn action_to_legacy_inner(
     args: ActionToLegacy,
     config: Arc<Config>,
@@ -870,6 +881,7 @@ fn action_to_legacy_inner(
 ) -> Result<()> {
     let iostore = iostore::open(&args.input, config.clone())?;
     if !args.no_assets {
+        eprintln!("ASSET");
         action_to_legacy_assets(&args, file_writer, &*iostore, log)?;
     }
     if !args.no_shaders {
@@ -893,6 +905,7 @@ fn action_to_legacy_assets(
     log: &Log,
 ) -> Result<()> {
     let mut packages_to_extract = vec![];
+    eprintln!("Scanning packages...");
     for package_info in iostore.packages() {
         let chunk_id =
             FIoChunkId::from_package_id(package_info.id(), 0, EIoChunkType::ExportBundleData);
@@ -902,34 +915,29 @@ fn action_to_legacy_assets(
                 package_info.id()
             )
         })?;
-
         if !args.filter.is_empty() && !args.filter.iter().any(|f| package_path.contains(f)) {
             continue;
         }
-
+        eprintln!("Queued: {package_path}");
         packages_to_extract.push((package_info, package_path));
     }
+    eprintln!("Found {} packages to extract", packages_to_extract.len());
 
     let package_file_version: Option<FPackageFileVersion> =
         args.version.map(|v| v.package_file_version());
     let package_context = FZenPackageContext::create(iostore, package_file_version, log);
-
     let count = packages_to_extract.len();
     let failed_count = AtomicUsize::new(0);
     let progress = Some(indicatif::ProgressBar::new(count as u64).with_style(progress_style()));
     log.set_progress(progress.as_ref());
     let prog_ref = progress.as_ref();
-
     let process = |(package_info, package_path): &(PackageInfo, String)| -> Result<()> {
         verbose!(log, "{package_path}");
-
-        // TODO make configurable
         let path = package_path
             .strip_prefix("../../../")
             .with_context(|| format!("failed to strip mount prefix from {package_path:?}"))?;
-
+        eprintln!("Converting: {path}");
         prog_ref.inspect(|p| p.set_message(path.to_string()));
-
         let res = asset_conversion::build_legacy(
             &package_context,
             package_info.id(),
@@ -938,30 +946,35 @@ fn action_to_legacy_assets(
         )
         .with_context(|| format!("Failed to convert {}", package_path.clone()));
         if let Err(err) = res {
+            eprintln!("FAILED: {path} — {err:#}");
             log!(log, "{err:#}");
             failed_count.fetch_add(1, Ordering::SeqCst);
+        } else {
+            eprintln!("OK: {path}");
         }
         prog_ref.inspect(|p| p.inc(1));
         Ok(())
     };
-
     if args.no_parallel {
         packages_to_extract.iter().try_for_each(process)?;
     } else {
         packages_to_extract.par_iter().try_for_each(process)?;
     }
-
     prog_ref.inspect(|p| p.finish_with_message(""));
     log.set_progress(None);
-
     let failed_count = failed_count.load(Ordering::SeqCst);
+    eprintln!(
+        "Done: extracted {} ({} failed) to {:?}",
+        count - failed_count,
+        failed_count,
+        args.output
+    );
     log!(
         log,
         "Extracted {} ({failed_count} failed) legacy assets to {:?}",
         count - failed_count,
         args.output
     );
-
     Ok(())
 }
 

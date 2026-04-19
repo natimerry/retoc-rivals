@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use fs_err as fs;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
     chunk_id::FIoChunkIdRaw,
@@ -194,14 +195,28 @@ impl IoStoreBackend {
         Ok(Self { containers: vec![] })
     }
     pub fn open<P: AsRef<Path>>(dir: P, config: Arc<Config>) -> Result<Self> {
-        let mut containers: Vec<Box<dyn IoStoreTrait>> = vec![];
-        for entry in fs::read_dir(dir.as_ref())? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension() == Some(OsStr::new("utoc")) {
-                containers.push(Box::new(IoStoreContainer::open(path, config.clone())?));
-            }
-        }
+        let paths: Vec<_> = fs::read_dir(dir.as_ref())?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.extension() == Some(OsStr::new("utoc")) {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+    
+        let mut containers: Vec<Box<dyn IoStoreTrait>> = paths
+            .par_iter()
+            .map(|path| -> Result<Box<dyn IoStoreTrait>> {
+                eprintln!("Opening container: {:?}", path);
+                let container = IoStoreContainer::open(path.clone(), config.clone())?;
+                eprintln!("Opened container: {:?}", path);
+                Ok(Box::new(container) as Box<dyn IoStoreTrait>)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        
         // Validate that all containers are of the same version
         let mut previous_container_version: Option<EIoStoreTocVersion> = None;
         let mut previous_container_name: String = String::new();
