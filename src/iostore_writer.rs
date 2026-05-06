@@ -4,10 +4,7 @@ use std::{
 };
 
 use crate::{
-    align_usize,
-    chunk_id::FIoChunkIdRaw,
-    container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry},
-    EIoChunkType, FPackageId, UEPath, UEPathBuf,
+    EIoChunkType, FPackageId, UEPath, UEPathBuf, align_usize, chunk_id::FIoChunkIdRaw, compression::{CompressionMethod, compress}, container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry}
 };
 use crate::{
     ser::*, EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FIoContainerId, FIoOffsetAndLength,
@@ -22,6 +19,7 @@ pub(crate) struct IoStoreWriter {
     cas_stream: BufWriter<fs::File>,
     toc: Toc,
     container_header: Option<FIoContainerHeader>,
+    compression: Option<CompressionMethod>,
 }
 
 impl IoStoreWriter {
@@ -34,6 +32,7 @@ impl IoStoreWriter {
         toc_version: EIoStoreTocVersion,
         container_header_version: Option<EIoContainerHeaderVersion>,
         mount_point: UEPathBuf,
+        compression: Option<CompressionMethod>,
     ) -> Result<Self> {
         let toc_path = toc_path.as_ref().to_path_buf();
         let name = toc_path.file_stem().unwrap().to_string_lossy();
@@ -41,14 +40,20 @@ impl IoStoreWriter {
         let cas_stream = BufWriter::new(fs::File::create(toc_path.with_extension("ucas"))?);
 
         let mut toc = Toc::new();
-        toc.compression_block_size = 0x10000;
+        toc.compression_block_size = 0x20000;
         toc.version = toc_version;
         toc.container_id = FIoContainerId::from_name(&name);
         toc.directory_index.mount_point = mount_point;
         toc.partition_size = u64::MAX;
 
+        if let Some(method) = compression {
+            toc.compression_methods.push(method);
+            toc.container_flags |= crate::EIoContainerFlags::Compressed
+        }
+
         let container_header =
             container_header_version.map(|v| FIoContainerHeader::new(v, toc.container_id));
+
 
         Ok(Self {
             toc_path,
@@ -56,6 +61,7 @@ impl IoStoreWriter {
             cas_stream,
             toc,
             container_header,
+            compression
         })
     }
     pub(crate) fn write_chunk_raw(
@@ -70,58 +76,80 @@ impl IoStoreWriter {
             data,
         )
     }
-    pub(crate) fn write_chunk(
-        &mut self,
-        chunk_id: FIoChunkId,
-        path: Option<&UEPath>,
-        data: &[u8],
-    ) -> Result<()> {
+
+    pub fn write_chunk(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
+        self.write_chunk_inner(chunk_id, path, data, self.compression)
+    }
+
+    pub fn write_chunk_uncompressed(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
+        self.write_chunk_inner(chunk_id, path, data, None)
+    }
+
+    fn write_chunk_inner(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8], compression: Option<CompressionMethod>) -> Result<()> {
         if let Some(path) = path {
             let index = &mut self.toc.directory_index;
-            let relative_path = path.strip_prefix(&index.mount_point).with_context(|| {
-                format!(
-                    "mount point {} does not contain path {path:?}",
-                    index.mount_point
-                )
-            })?;
+            let relative_path = path.strip_prefix(&index.mount_point).with_context(|| format!("mount point {} does not contain path {path}", index.mount_point))?;
             index.add_file(relative_path, self.toc.chunks.len() as u32);
         }
 
+        self.cas_stream.flush()?;
         let mut offset = self.cas_stream.stream_position()?;
-
         let start_block = self.toc.compression_blocks.len();
-
         let mut hasher = blake3::Hasher::new();
+
+        eprintln!("=== write_chunk chunk_idx={} start_block={} cas_offset={:#x} data_len={}",
+            self.toc.chunks.len(), start_block, offset, data.len());
+
         for block in data.chunks(self.toc.compression_block_size as usize) {
-            self.cas_stream.write_all(block)?;
             hasher.update(block);
-            let compressed_size = block.len() as u32;
+
+            let (bytes_to_write, compression_method_index) = match compression {
+                Some(method) => {
+                    let mut compressed = Vec::new();
+                    compress(method, block, &mut compressed)?;
+                    if compressed.len() < block.len() {
+                        (compressed, 1u8)
+                    } else {
+                        (block.to_vec(), 0u8)
+                    }
+                }
+                None => (block.to_vec(), 0u8),
+            };
+
+            let compressed_size = bytes_to_write.len() as u32;
             let uncompressed_size = block.len() as u32;
-            let compression_method_index = 0; // "None"
-            self.toc
-                .compression_blocks
-                .push(FIoStoreTocCompressedBlockEntry::new(
-                    offset,
-                    compressed_size,
-                    uncompressed_size,
-                    compression_method_index,
-                ));
-            offset += compressed_size as u64;
+
+            self.cas_stream.write_all(&bytes_to_write)?;
+
+            let written_size = bytes_to_write.len() as u32;
+            eprintln!("  block cas_offset={:#x} compressed={} uncompressed={} method={}",
+                offset, compressed_size, uncompressed_size, compression_method_index);
+
+
+            self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(
+                offset,
+                compressed_size,
+                uncompressed_size,
+                compression_method_index,
+            ));
+
+            offset += written_size as u64;
         }
+
+        let logical_offset = start_block as u64 * self.toc.compression_block_size as u64;
+        eprintln!("  => logical_offset={:#x} (start_block={} * block_size={:#x})",
+            logical_offset, start_block, self.toc.compression_block_size);
+
         let hash = hasher.finalize();
         let meta = FIoStoreTocEntryMeta {
             chunk_hash: FIoChunkHash::from_blake3(hash.as_bytes()),
             flags: FIoStoreTocEntryMetaFlags::empty(),
         };
-
         let offset_and_length = FIoOffsetAndLength::new(
             start_block as u64 * self.toc.compression_block_size as u64,
             data.len() as u64,
         );
-
-        self.toc
-            .chunks
-            .push(chunk_id.with_version(self.toc.version));
+        self.toc.chunks.push(chunk_id.with_version(self.toc.version));
         self.toc.chunk_offset_lengths.push(offset_and_length);
         self.toc.chunk_metas.push(meta);
 
@@ -187,7 +215,7 @@ impl IoStoreWriter {
                 0,
                 EIoChunkType::ContainerHeader,
             );
-            self.write_chunk(chunk_id, None, &chunk_buffer)?;
+            self.write_chunk_uncompressed(chunk_id, None, &chunk_buffer)?;
         }
         self.toc_stream.ser(&self.toc)?;
         Ok(())

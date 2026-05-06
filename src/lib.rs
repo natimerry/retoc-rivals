@@ -128,6 +128,7 @@ struct ActionPackRaw {
     input: PathBuf,
     #[arg(index = 2)]
     utoc: PathBuf,
+    compression: Option<CompressionMethod>
 }
 
 #[derive(Parser, Debug)]
@@ -198,6 +199,7 @@ pub struct ActionToZen {
     #[arg(long)]
     no_parallel: bool,
     pub obfuscate: bool,
+    compression: Option<CompressionMethod>,
 }
 
 impl ActionToZen {
@@ -216,6 +218,8 @@ impl ActionToZen {
             debug: false,
             no_parallel: false,
             obfuscate: false,
+            compression: Some(CompressionMethod::Oodle)
+            // compression,
         }
     }
 }
@@ -685,6 +689,7 @@ fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
         manifest.version,
         None,
         manifest.mount_point.into(),
+        args.compression
     )?;
     for entry in args.input.join("chunks").read_dir()? {
         let entry = entry?;
@@ -1048,6 +1053,7 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         args.version.toc_version(),
         Some(container_header_version),
         mount_point.into(),
+        args.compression
     )?;
 
     let log = Log::new(args.verbose, args.debug);
