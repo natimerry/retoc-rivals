@@ -1,6 +1,6 @@
 mod asset_conversion;
 mod compact_binary;
-mod compression;
+pub mod compression;
 mod container_header;
 mod file_pool;
 mod iostore;
@@ -208,7 +208,7 @@ impl ActionToZen {
         self
     }
 
-    pub fn new(input: PathBuf, output: PathBuf, version: EngineVersion) -> Self {
+    pub fn new(input: PathBuf, output: PathBuf, version: EngineVersion, compression: Option<crate::CompressionMethod>) -> Self {
         Self {
             input,
             output,
@@ -218,8 +218,8 @@ impl ActionToZen {
             debug: false,
             no_parallel: false,
             obfuscate: false,
-            compression: Some(CompressionMethod::Oodle)
-            // compression,
+            // compression: Some(CompressionMethod::Oodle)
+            compression,
         }
     }
 }
@@ -689,7 +689,8 @@ fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
         manifest.version,
         None,
         manifest.mount_point.into(),
-        args.compression
+        args.compression,
+        false
     )?;
     for entry in args.input.join("chunks").read_dir()? {
         let entry = entry?;
@@ -1053,7 +1054,8 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         args.version.toc_version(),
         Some(container_header_version),
         mount_point.into(),
-        args.compression
+        args.compression,
+        args.obfuscate,
     )?;
 
     let log = Log::new(args.verbose, args.debug);
@@ -1132,7 +1134,6 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     // Decide whenever we need all packages to be in memory at the same time to perform the fixup or not
     let needs_asset_import_fixup = container_header_version <= EIoContainerHeaderVersion::Initial;
 
-    writer.set_obfuscated(args.obfuscate);
     let process_assets = |tx: std::sync::mpsc::SyncSender<ConvertedZenAssetBundle>| -> Result<()> {
         let process = |path: &&UEPathBuf| -> Result<()> {
             verbose!(&log, "converting asset {path:?}");
