@@ -544,7 +544,7 @@ fn is_valid_material_entry(data: &[u8], offset: usize, name_count: usize) -> boo
     let Some(package_index) = read_i32_at(data, offset) else {
         return false;
     };
-    if package_index > 0 || package_index < -100_000 {
+    if package_index > 0 || package_index < -10_000 {
         return false;
     }
 
@@ -603,6 +603,110 @@ fn validate_material_array(
     }
 
     true
+}
+
+fn material_array_score(
+    data: &[u8],
+    materials_offset: usize,
+    count: usize,
+    layout: MaterialArrayLayout,
+    name_map: &FPackageNameMap,
+    expected_slot_names: &[&str],
+) -> usize {
+    match layout {
+        MaterialArrayLayout::PaddedTagged => {
+            score_tagged_material_array_slots(data, materials_offset, count, name_map, expected_slot_names)
+        }
+        MaterialArrayLayout::Legacy => score_material_array_slots(
+            data,
+            materials_offset,
+            count,
+            LEGACY_SKELETAL_MATERIAL_SIZE,
+            name_map,
+            expected_slot_names,
+        ),
+        MaterialArrayLayout::PaddedEmpty => score_material_array_slots(
+            data,
+            materials_offset,
+            count,
+            EMPTY_TAG_SKELETAL_MATERIAL_SIZE,
+            name_map,
+            expected_slot_names,
+        ),
+    }
+}
+
+fn first_material_package_index_is_import(data: &[u8], materials_offset: usize) -> bool {
+    matches!(
+        read_i32_at(data, materials_offset),
+        Some(package_index) if package_index < 0 && package_index >= -10_000
+    )
+}
+
+fn find_first_material_array_by_layout(
+    export_data: &[u8],
+    name_map: &FPackageNameMap,
+    expected_slot_names: &[&str],
+    layout: MaterialArrayLayout,
+) -> Option<MaterialArrayCandidate> {
+    let name_count = name_map.get_all_names().len();
+    let stride = match layout {
+        MaterialArrayLayout::Legacy => LEGACY_SKELETAL_MATERIAL_SIZE,
+        MaterialArrayLayout::PaddedEmpty => EMPTY_TAG_SKELETAL_MATERIAL_SIZE,
+        MaterialArrayLayout::PaddedTagged => EMPTY_TAG_SKELETAL_MATERIAL_SIZE,
+    };
+    if export_data.len() < 4 + stride {
+        return None;
+    }
+
+    let max_count_offset = export_data.len() - 4 - stride;
+    for count_offset in 4..=max_count_offset {
+        let Some(count) = read_i32_at(export_data, count_offset) else {
+            continue;
+        };
+        if count <= 0 || count > MAX_SKELETAL_MATERIALS {
+            continue;
+        }
+
+        let materials_offset = count_offset + 4;
+        if !first_material_package_index_is_import(export_data, materials_offset) {
+            continue;
+        }
+
+        let byte_len = if layout == MaterialArrayLayout::PaddedTagged {
+            let Some(byte_len) = validate_tagged_material_array(export_data, materials_offset, count, name_count) else {
+                continue;
+            };
+            byte_len
+        } else {
+            if !validate_material_array(export_data, materials_offset, count, layout, name_count) {
+                continue;
+            }
+            count as usize * stride
+        };
+
+        let score = material_array_score(
+            export_data,
+            materials_offset,
+            count as usize,
+            layout,
+            name_map,
+            expected_slot_names,
+        );
+        if !expected_slot_names.is_empty() && score == 0 {
+            continue;
+        }
+
+        return Some(MaterialArrayCandidate {
+            offset: materials_offset,
+            count: count as usize,
+            layout,
+            score,
+            byte_len,
+        });
+    }
+
+    None
 }
 
 fn validate_tagged_material_array(
@@ -721,120 +825,14 @@ fn find_skeletal_material_array(
     package_name: &str,
     expected_slot_names: &[&str],
 ) -> Option<MaterialArrayCandidate> {
-    let name_count = name_map.get_all_names().len();
-    if export_data.len() < 4 + LEGACY_SKELETAL_MATERIAL_SIZE {
-        return None;
-    }
-
-    let max_count_offset = export_data.len() - 4 - LEGACY_SKELETAL_MATERIAL_SIZE;
-    let mut best_legacy: Option<MaterialArrayCandidate> = None;
-    let mut best_padded: Option<MaterialArrayCandidate> = None;
-    let mut best_tagged: Option<MaterialArrayCandidate> = None;
-
-    for count_offset in 0..=max_count_offset {
-        let Some(count) = read_i32_at(export_data, count_offset) else {
-            continue;
-        };
-        if count <= 0 || count > MAX_SKELETAL_MATERIALS {
-            continue;
-        }
-
-        let materials_offset = count_offset + 4;
-        let looks_padded = validate_material_array(
-            export_data,
-            materials_offset,
-            count,
-            MaterialArrayLayout::PaddedEmpty,
-            name_count,
-        );
-        let looks_legacy = validate_material_array(
-            export_data,
-            materials_offset,
-            count,
-            MaterialArrayLayout::Legacy,
-            name_count,
-        );
-        let tagged_byte_len =
-            validate_tagged_material_array(export_data, materials_offset, count, name_count);
-
-        if let Some(byte_len) = tagged_byte_len {
-            let score = score_tagged_material_array_slots(
-                export_data,
-                materials_offset,
-                count as usize,
-                name_map,
-                expected_slot_names,
-            );
-            if expected_slot_names.is_empty() || score != 0 {
-                let candidate = MaterialArrayCandidate {
-                    offset: materials_offset,
-                    count: count as usize,
-                    layout: MaterialArrayLayout::PaddedTagged,
-                    score,
-                    byte_len,
-                };
-                if best_tagged.map_or(true, |best| {
-                    (candidate.score, candidate.count, candidate.byte_len) > (best.score, best.count, best.byte_len)
-                }) {
-                    best_tagged = Some(candidate);
-                }
-            }
-        }
-
-        if looks_padded {
-            let score = score_material_array_slots(
-                export_data,
-                materials_offset,
-                count as usize,
-                EMPTY_TAG_SKELETAL_MATERIAL_SIZE,
-                name_map,
-                expected_slot_names,
-            );
-            if expected_slot_names.is_empty() || score != 0 {
-                let candidate = MaterialArrayCandidate {
-                    offset: materials_offset,
-                    count: count as usize,
-                    layout: MaterialArrayLayout::PaddedEmpty,
-                    score,
-                    byte_len: count as usize * EMPTY_TAG_SKELETAL_MATERIAL_SIZE,
-                };
-                if best_padded.map_or(true, |best| {
-                    (candidate.score, candidate.count) > (best.score, best.count)
-                }) {
-                    best_padded = Some(candidate);
-                }
-            }
-        }
-
-        if looks_legacy {
-            let score = score_material_array_slots(
-                export_data,
-                materials_offset,
-                count as usize,
-                LEGACY_SKELETAL_MATERIAL_SIZE,
-                name_map,
-                expected_slot_names,
-            );
-            if expected_slot_names.is_empty() || score != 0 {
-                let candidate = MaterialArrayCandidate {
-                    offset: materials_offset,
-                    count: count as usize,
-                    layout: MaterialArrayLayout::Legacy,
-                    score,
-                    byte_len: count as usize * LEGACY_SKELETAL_MATERIAL_SIZE,
-                };
-                if best_legacy.map_or(true, |best| {
-                    (candidate.score, candidate.count) > (best.score, best.count)
-                }) {
-                    best_legacy = Some(candidate);
-                }
-            }
-        }
-    }
-
-    if let Some(candidate) = best_tagged {
+    if let Some(candidate) = find_first_material_array_by_layout(
+        export_data,
+        name_map,
+        expected_slot_names,
+        MaterialArrayLayout::PaddedTagged,
+    ) {
         let has_existing_tags = candidate.byte_len > candidate.count * EMPTY_TAG_SKELETAL_MATERIAL_SIZE;
-        if expected_slot_names.is_empty() || has_existing_tags && best_legacy.is_none_or(|legacy| candidate.score >= legacy.score) {
+        if has_existing_tags {
             eprintln!(
                 "[MaterialTags] {} - Found prepatched tagged FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)",
                 package_name, candidate.offset, candidate.count, candidate.score
@@ -843,27 +841,25 @@ fn find_skeletal_material_array(
         }
     }
 
-    if let Some(candidate) = best_padded {
-        if expected_slot_names.is_empty() {
-            eprintln!(
-                "[MaterialTags] {} - Found prepatched FSkeletalMaterial array at {:#X}: {} material(s)",
-                package_name, candidate.offset, candidate.count
-            );
-            return Some(candidate);
-        }
-
-        if best_legacy.is_none_or(|legacy| {
-            (candidate.score, candidate.count) > (legacy.score, legacy.count)
-        }) {
-            eprintln!(
-                "[MaterialTags] {} - Found prepatched FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)",
-                package_name, candidate.offset, candidate.count, candidate.score
-            );
-            return Some(candidate);
-        }
+    if let Some(candidate) = find_first_material_array_by_layout(
+        export_data,
+        name_map,
+        expected_slot_names,
+        MaterialArrayLayout::PaddedEmpty,
+    ) {
+        eprintln!(
+            "[MaterialTags] {} - Found prepatched FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)",
+            package_name, candidate.offset, candidate.count, candidate.score
+        );
+        return Some(candidate);
     }
 
-    if let Some(candidate) = best_legacy {
+    if let Some(candidate) = find_first_material_array_by_layout(
+        export_data,
+        name_map,
+        expected_slot_names,
+        MaterialArrayLayout::Legacy,
+    ) {
         eprintln!(
             "[MaterialTags] {} - Found legacy FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)",
             package_name, candidate.offset, candidate.count, candidate.score
@@ -926,8 +922,8 @@ fn patch_material_tags(builder: &mut ZenPackageBuilder) -> bool {
         let mesh_export_serial_offset = builder.legacy_package.exports[skeletal_mesh_idx].serial_offset;
         builder.legacy_package.exports[skeletal_mesh_idx].serial_size += size_diff as i64;
 
-        for (idx, exp) in builder.legacy_package.exports.iter_mut().enumerate() {
-            if idx > skeletal_mesh_idx && exp.serial_offset > mesh_export_serial_offset {
+        for exp in builder.legacy_package.exports.iter_mut() {
+            if exp.serial_offset > mesh_export_serial_offset {
                 exp.serial_offset += size_diff as i64;
             }
         }
