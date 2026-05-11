@@ -254,6 +254,8 @@ mod test {
             EIoStoreTocVersion::PerfectHashWithOverflow,
             Some(EIoContainerHeaderVersion::OptionalSegmentPackages),
             "../../..".into(),
+            None,
+            false,
         )?;
 
         let data = fs::read("tests/UE5.3/ScriptObjects.bin")?;

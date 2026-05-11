@@ -334,6 +334,8 @@ mod test {
             ue_version.toc_version(),
             None,
             UEPathBuf::new(),
+            None,
+            false,
         )?;
 
         let (buf_names, buf_name_hashes) = write_name_batch_parts(&names.copy_raw_names())?;
