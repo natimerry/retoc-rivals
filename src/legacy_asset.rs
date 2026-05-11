@@ -522,6 +522,9 @@ impl FPackageNameMap {
             bare_name.into()
         }
     }
+    pub(crate) fn get_all_names(&self) -> &[String] {
+        &self.names
+    }
     pub(crate) fn store(&mut self, name: &str) -> FMinimalName {
         let (name_without_number, name_number) = break_down_name_string(name);
 
