@@ -4,7 +4,7 @@ use crate::legacy_asset::{
     convert_localized_package_name_to_source, get_package_object_full_name, EPackageFlags,
     FLegacyPackageFileSummary, FLegacyPackageHeader, FSerializedAssetBundle, FPackageNameMap,
 };
-use crate::logging::{log, Log};
+use crate::logging::{emit_log, log, Log};
 use crate::name_map::{EMappedNameType, FNameMap};
 use crate::script_objects::{
     FPackageImportReference, FPackageObjectIndex, FPackageObjectIndexType,
@@ -124,11 +124,11 @@ fn parse_material_slot_tags_from_binary(
     let mut scanned_props = 0;
 
     let has_material_slot_tags = all_names.iter().any(|n| n.contains("MaterialSlotTags"));
-    eprintln!("[MaterialTags] {} - Name map has 'MaterialSlotTags': {}", package_name, has_material_slot_tags);
+    emit_log(&format!("[MaterialTags] {} - Name map has 'MaterialSlotTags': {}", package_name, has_material_slot_tags));
     if has_material_slot_tags {
         for (i, name) in all_names.iter().enumerate() {
             if name.contains("MaterialSlot") {
-                eprintln!("[MaterialTags] {} - Name map[{}] = '{}'", package_name, i, name);
+                emit_log(&format!("[MaterialTags] {} - Name map[{}] = '{}'", package_name, i, name));
             }
         }
     }
@@ -149,12 +149,12 @@ fn parse_material_slot_tags_from_binary(
         let prop_name = all_names[name_idx as usize].clone();
 
         if scanned_props < 3 {
-            eprintln!("[MaterialTags] {} - Scanning property[{}]: '{}' at offset {}", package_name, scanned_props, prop_name, offset - 4);
+            emit_log(&format!("[MaterialTags] {} - Scanning property[{}]: '{}' at offset {}", package_name, scanned_props, prop_name, offset - 4));
             scanned_props += 1;
         }
 
         if prop_name.contains("MaterialSlot") {
-            eprintln!("[MaterialTags] {} - Found MaterialSlotTags at offset {}", package_name, offset - 4);
+            emit_log(&format!("[MaterialTags] {} - Found MaterialSlotTags at offset {}", package_name, offset - 4));
 
             if offset + 4 > data_len {
                 break;
@@ -183,7 +183,7 @@ fn parse_material_slot_tags_from_binary(
                     export_data[offset + 3],
                 ]);
                 offset += 4;
-                eprintln!("[MaterialTags] {} - Type: {}, Struct: {}", package_name, type_idx, struct_idx);
+                emit_log(&format!("[MaterialTags] {} - Type: {}, Struct: {}", package_name, type_idx, struct_idx));
             }
 
             if offset + 4 > data_len {
@@ -208,7 +208,7 @@ fn parse_material_slot_tags_from_binary(
                 offset += 4;
             }
 
-            eprintln!("[MaterialTags] {} - Array has {} elements", package_name, array_len);
+            emit_log(&format!("[MaterialTags] {} - Array has {} elements", package_name, array_len));
 
             for _ in 0..array_len {
                 if offset + 8 > data_len {
@@ -425,13 +425,13 @@ fn scan_material_slot_tags_from_export(
     } else {
         let tagged_slots = entries.iter().filter(|entry| !entry.tag_names.is_empty()).count();
         let total_tags: usize = entries.iter().map(|entry| entry.tag_names.len()).sum();
-        eprintln!(
+        emit_log(&format!(
             "[MaterialTags] {} - Scanned MaterialSlotTags: {} slot(s), {} tagged slot(s), {} tag(s)",
             package_name,
             entries.len(),
             tagged_slots,
             total_tags
-        );
+        ));
         Some(entries)
     }
 }
@@ -446,7 +446,7 @@ fn patch_skeletal_mesh_materials(
     let material_array = match find_skeletal_material_array(export_data, name_map, package_name, &expected_slot_names) {
         Some(result) => result,
         None => {
-            eprintln!("[MaterialTags] {} - Could not find valid FSkeletalMaterial array", package_name);
+            emit_log(&format!("[MaterialTags] {} - Could not find valid FSkeletalMaterial array", package_name));
             return false;
         }
     };
@@ -455,10 +455,10 @@ fn patch_skeletal_mesh_materials(
         material_array.layout,
         MaterialArrayLayout::PaddedEmpty | MaterialArrayLayout::PaddedTagged
     ) {
-        eprintln!(
+        emit_log(&format!(
             "[MaterialTags] {} - Skipping (prepatched, {} material(s))",
             package_name, material_array.count
-        );
+        ));
         return false;
     }
 
@@ -501,14 +501,14 @@ fn patch_skeletal_mesh_materials(
     new_data.extend_from_slice(&export_data[materials_end..]);
 
     let size_diff = new_data.len() as isize - export_data.len() as isize;
-    eprintln!(
+    emit_log(&format!(
         "[MaterialTags] {} - Added FGameplayTagContainer to {} material(s), injected {} tag(s) into {} material(s), size change: +{} bytes",
         package_name,
         material_array.count,
         total_injected_tags,
         tagged_materials,
         size_diff
-    );
+    ));
 
     *export_data = new_data;
     true
@@ -833,10 +833,10 @@ fn find_skeletal_material_array(
     ) {
         let has_existing_tags = candidate.byte_len > candidate.count * EMPTY_TAG_SKELETAL_MATERIAL_SIZE;
         if has_existing_tags {
-            eprintln!(
+            emit_log(&format!(
                 "[MaterialTags] {} - Found prepatched tagged FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)",
                 package_name, candidate.offset, candidate.count, candidate.score
-            );
+            ));
             return Some(candidate);
         }
     }
@@ -847,10 +847,10 @@ fn find_skeletal_material_array(
         expected_slot_names,
         MaterialArrayLayout::PaddedEmpty,
     ) {
-        eprintln!(
+        emit_log(&format!(
             "[MaterialTags] {} - Found prepatched FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)",
             package_name, candidate.offset, candidate.count, candidate.score
-        );
+        ));
         return Some(candidate);
     }
 
@@ -860,10 +860,10 @@ fn find_skeletal_material_array(
         expected_slot_names,
         MaterialArrayLayout::Legacy,
     ) {
-        eprintln!(
+        emit_log(&format!(
             "[MaterialTags] {} - Found legacy FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)",
             package_name, candidate.offset, candidate.count, candidate.score
-        );
+        ));
         return Some(candidate);
     }
 
@@ -887,7 +887,7 @@ fn patch_material_tags(builder: &mut ZenPackageBuilder) -> bool {
     let mesh_size = mesh_export.serial_size as usize;
 
     if mesh_offset + mesh_size > builder.exports_file_buffer.len() {
-        eprintln!("[MaterialTags] {} - SkeletalMesh export out of bounds", package_name);
+        emit_log(&format!("[MaterialTags] {} - SkeletalMesh export out of bounds", package_name));
         return false;
     }
 
@@ -904,13 +904,13 @@ fn patch_material_tags(builder: &mut ZenPackageBuilder) -> bool {
 
             if !tag_data.is_empty() {
                 let total_tags: usize = tag_data.iter().map(|t| t.tag_names.len()).sum();
-                eprintln!("[MaterialTags] {} - Found {} tag(s) across {} slot(s)", package_name, total_tags, tag_data.len());
+                emit_log(&format!("[MaterialTags] {} - Found {} tag(s) across {} slot(s)", package_name, total_tags, tag_data.len()));
             }
         }
     }
 
     if tag_data.is_empty() {
-        eprintln!("[MaterialTags] {} - Will patch with null containers (no tags found)", package_name);
+        emit_log(&format!("[MaterialTags] {} - Will patch with null containers (no tags found)", package_name));
     }
 
     let mut mesh_export_data_mut = builder.exports_file_buffer[mesh_offset..mesh_offset + mesh_size].to_vec();
@@ -928,7 +928,7 @@ fn patch_material_tags(builder: &mut ZenPackageBuilder) -> bool {
             }
         }
 
-        eprintln!("[MaterialTags] {} - Patched, size change: +{} bytes", package_name, size_diff);
+        emit_log(&format!("[MaterialTags] {} - Patched, size change: +{} bytes", package_name, size_diff));
         return true;
     }
 
@@ -1243,7 +1243,7 @@ fn convert_legacy_import_to_object_index(
             "/Script/Engine"
         };
 
-        eprintln!("[MaterialTags] Remapped import[{}]: {} -> {}", import_index, full_import_name, replaced_path);
+        emit_log(&format!("[MaterialTags] Remapped import[{}]: {} -> {}", import_index, full_import_name, replaced_path));
         return Ok(FPackageObjectIndex::create_script_import(replaced_path));
     }
 

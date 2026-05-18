@@ -51,6 +51,7 @@ use std::{
 use strum::{AsRefStr, FromRepr};
 use tracing::instrument;
 pub use version::EngineVersion;
+pub use logging::{reset_log_provider_to_stdout, set_log_provider, LogProvider};
 use zen_asset_conversion::ConvertedZenAssetBundle;
 
 /// Public function to open an IO store container
@@ -637,7 +638,7 @@ pub fn extract_package_exports(utoc: &Path, config: Arc<Config>, output: &Path) 
             UEPath::new(path),
             &file_writer,
         ) {
-            eprintln!("Skipping {path}: {e}");
+            emit_log(&format!("Skipping {path}: {e}"));
         }
     }
     Ok(())
@@ -898,9 +899,9 @@ fn action_to_legacy_inner(
 
 fn progress_style() -> indicatif::ProgressStyle {
     indicatif::ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {wide_msg}",
+        "[{elapsed_precise}] {bar:40.cyan/blue} assets {pos:>7}/{len:7}",
     )
-    .unwrap()
+    .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
     .progress_chars("##-")
 }
 
@@ -924,15 +925,18 @@ fn action_to_legacy_assets(
         if !args.filter.is_empty() && !args.filter.iter().any(|f| package_path.contains(f)) {
             continue;
         }
-        eprintln!("Queued: {package_path}");
         packages_to_extract.push((package_info, package_path));
     }
-    eprintln!("Found {} packages to extract", packages_to_extract.len());
+    let count = packages_to_extract.len();
+    eprintln!("Found {count} assets to convert");
+    if count == 0 {
+        eprintln!("No assets matched the to-legacy filter");
+        return Ok(());
+    }
 
     let package_file_version: Option<FPackageFileVersion> =
         args.version.map(|v| v.package_file_version());
     let package_context = FZenPackageContext::create(iostore, package_file_version, log);
-    let count = packages_to_extract.len();
     let failed_count = AtomicUsize::new(0);
     let progress = Some(indicatif::ProgressBar::new(count as u64).with_style(progress_style()));
     log.set_progress(progress.as_ref());
@@ -942,8 +946,6 @@ fn action_to_legacy_assets(
         let path = package_path
             .strip_prefix("../../../")
             .with_context(|| format!("failed to strip mount prefix from {package_path:?}"))?;
-        eprintln!("Converting: {path}");
-        prog_ref.inspect(|p| p.set_message(path.to_string()));
         let res = asset_conversion::build_legacy(
             &package_context,
             package_info.id(),
@@ -952,13 +954,13 @@ fn action_to_legacy_assets(
         )
         .with_context(|| format!("Failed to convert {}", package_path.clone()));
         if let Err(err) = res {
-            eprintln!("FAILED: {path} — {err:#}");
-            log!(log, "{err:#}");
+            prog_ref.inspect(|p| p.println(format!("FAILED: {path} - {err:#}")));
             failed_count.fetch_add(1, Ordering::SeqCst);
-        } else {
-            eprintln!("OK: {path}");
         }
-        prog_ref.inspect(|p| p.inc(1));
+        prog_ref.inspect(|p| {
+            p.inc(1);
+            emit_progress(p.position(), p.length().unwrap_or(0));
+        });
         Ok(())
     };
     if args.no_parallel {
@@ -966,9 +968,16 @@ fn action_to_legacy_assets(
     } else {
         packages_to_extract.par_iter().try_for_each(process)?;
     }
-    prog_ref.inspect(|p| p.finish_with_message(""));
     log.set_progress(None);
     let failed_count = failed_count.load(Ordering::SeqCst);
+    prog_ref.inspect(|p| {
+        p.finish_with_message(format!(
+            "Done: {} / {} assets converted ({} failed)",
+            count - failed_count,
+            count,
+            failed_count
+        ));
+    });
     eprintln!(
         "Done: extracted {} ({} failed) to {:?}",
         count - failed_count,
@@ -1122,8 +1131,10 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         )?;
     }
 
+    let asset_count = asset_paths.len();
+    log!(&log, "Converting {asset_count} assets to Zen");
     let progress =
-        Some(indicatif::ProgressBar::new(asset_paths.len() as u64).with_style(progress_style()));
+        Some(indicatif::ProgressBar::new(asset_count as u64).with_style(progress_style()));
     log.set_progress(progress.as_ref());
     let prog_ref = progress.as_ref();
 
@@ -1137,8 +1148,6 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     let process_assets = |tx: std::sync::mpsc::SyncSender<ConvertedZenAssetBundle>| -> Result<()> {
         let process = |path: &&UEPathBuf| -> Result<()> {
             verbose!(&log, "converting asset {path:?}");
-
-            prog_ref.inspect(|p| p.set_message(path.to_string()));
 
             let bundle = FSerializedAssetBundle {
                 asset_file_buffer: input.read(path)?,
@@ -1159,7 +1168,10 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
 
             tx.send(converted)?;
 
-            prog_ref.inspect(|p| p.inc(1));
+            prog_ref.inspect(|p| {
+                p.inc(1);
+                emit_progress(p.position(), p.length().unwrap_or(0));
+            });
             Ok(())
         };
 
@@ -1212,7 +1224,10 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
                     .write()
                     .unwrap()
                     .fixup_legacy_external_arcs(&converted_lookup, &log)?;
-                prog_ref.inspect(|x| x.inc(1));
+                prog_ref.inspect(|x| {
+                    x.inc(1);
+                    emit_progress(x.position(), x.length().unwrap_or(0));
+                });
             }
             log!(log, "Writing converted assets");
             prog_ref.inspect(|x| x.set_position(0));
@@ -1220,7 +1235,10 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
             // Write all the package data for each asset once fixups are complete
             for converted in &all_converted {
                 converted.write().unwrap().write_package_data(&mut writer)?;
-                prog_ref.inspect(|x| x.inc(1));
+                prog_ref.inspect(|x| {
+                    x.inc(1);
+                    emit_progress(x.position(), x.length().unwrap_or(0));
+                });
             }
         } else {
             // Write the assets immediately otherwise as they are processed
@@ -1232,12 +1250,14 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     })?;
     result.unwrap()?;
 
-    prog_ref.inspect(|p| p.finish_with_message(""));
+    prog_ref.inspect(|p| {
+        p.finish_with_message(format!("Done: {asset_count} / {asset_count} assets converted"));
+    });
     log.set_progress(None);
 
     writer.finalize()?;
 
-    println!("Skipping writing pak file as repak is responsible for generating the pak file");
+    debug!(&log, "Skipping writing pak file as repak is responsible for generating the pak file");
 
     Ok(())
 }

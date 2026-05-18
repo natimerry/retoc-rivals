@@ -14,6 +14,7 @@ use crate::{
     chunk_id::FIoChunkIdRaw,
     container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry},
     file_pool::FilePool,
+    logging::emit_log,
     script_objects::ZenScriptObjects,
     ser::*,
     Config, EIoChunkType, EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FPackageId, Toc,
@@ -210,9 +211,9 @@ impl IoStoreBackend {
         let mut containers: Vec<Box<dyn IoStoreTrait>> = paths
             .par_iter()
             .map(|path| -> Result<Box<dyn IoStoreTrait>> {
-                eprintln!("Opening container: {:?}", path);
+                emit_log(&format!("Opening container: {:?}", path));
                 let container = IoStoreContainer::open(path.clone(), config.clone())?;
-                eprintln!("Opened container: {:?}", path);
+                emit_log(&format!("Opened container: {:?}", path));
                 Ok(Box::new(container) as Box<dyn IoStoreTrait>)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -382,7 +383,7 @@ impl IoStoreContainer {
                     container.container_header = Some(header);
                 }
                 Err(err) => {
-                    eprintln!("Failed to parse ContainerHeader ({chunk_id:?}). Package metadata will be unavailable: {err:?}");
+                    emit_log(&format!("Failed to parse ContainerHeader ({chunk_id:?}). Package metadata will be unavailable: {err:?}"));
                 }
             }
         }

@@ -1,4 +1,46 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+pub trait LogProvider: Send + Sync + 'static {
+    fn log(&self, msg: &str);
+
+    fn progress(&self, _position: u64, _length: u64) {}
+}
+
+struct StdoutLogProvider;
+
+impl LogProvider for StdoutLogProvider {
+    fn log(&self, msg: &str) {
+        println!("{msg}");
+    }
+}
+
+static LOG_PROVIDER: OnceLock<RwLock<Arc<dyn LogProvider>>> = OnceLock::new();
+
+fn provider() -> &'static RwLock<Arc<dyn LogProvider>> {
+    LOG_PROVIDER.get_or_init(|| RwLock::new(Arc::new(StdoutLogProvider)))
+}
+
+pub fn set_log_provider(log_provider: Arc<dyn LogProvider>) {
+    if let Ok(mut provider) = provider().write() {
+        *provider = log_provider;
+    }
+}
+
+pub fn reset_log_provider_to_stdout() {
+    set_log_provider(Arc::new(StdoutLogProvider));
+}
+
+pub fn emit_log(msg: &str) {
+    if let Ok(provider) = provider().read() {
+        provider.log(msg);
+    }
+}
+
+pub fn emit_progress(position: u64, length: u64) {
+    if let Ok(provider) = provider().read() {
+        provider.progress(position, length);
+    }
+}
 
 // log macros to check if log and log channel is enabled before performing potentially expensive string formatting
 macro_rules! log {
@@ -48,7 +90,7 @@ impl Log {
         if let Some(progress) = self.progress.lock().unwrap().as_ref() {
             progress.println(msg);
         } else {
-            println!("{msg}");
+            emit_log(msg);
         }
     }
     pub(crate) fn verbose_enabled(&self) -> bool {
