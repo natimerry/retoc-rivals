@@ -3,20 +3,27 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const BINDING_NAME: &str = "KawaiiPhysicsBinding";
+const EMBED_RS_NAME: &str = "kawaii_binding_embed.rs";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RETOC_SKIP_KAWAII_BINDING_BUILD");
     println!("cargo:rerun-if-changed=../UAssetAPI/KawaiiPhysicsBinding");
     println!("cargo:rerun-if-changed=../UAssetAPI/KawaiiPhysicsLegacyPorter.cs");
 
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR was not set"));
+    let embed_rs = out_dir.join(EMBED_RS_NAME);
+
     if env::var_os("RETOC_SKIP_KAWAII_BINDING_BUILD").is_some() {
+        write_empty_embed_file(&embed_rs);
         println!(
             "cargo:warning=Skipping KawaiiPhysicsBinding build because RETOC_SKIP_KAWAII_BINDING_BUILD is set"
         );
         return;
     }
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let manifest_dir = PathBuf::from(
+        env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR was not set"),
+    );
 
     let project = manifest_dir
         .parent()
@@ -36,7 +43,6 @@ fn main() {
         panic!("unsupported target for KawaiiPhysicsBinding: {target_os}-{target_arch}")
     });
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let build_root = out_dir.join("kawaii_physics_binding");
     let publish_dir = build_root.join("publish");
 
@@ -70,10 +76,12 @@ fn main() {
         .arg(rid)
         .arg("--self-contained")
         .arg("true")
-        // .arg("-p:OutputType=Exe")
         .arg("-p:PublishAot=false")
-        .arg("-p:PublishSingleFile=false")
-        .arg("-p:NativeLib=")
+        .arg("-p:PublishSingleFile=true")
+        .arg("-p:IncludeNativeLibrariesForSelfExtract=true")
+        .arg("-p:EnableCompressionInSingleFile=true")
+        .arg("-p:DebugType=embedded")
+        .arg("-p:DebugSymbols=false")
         .arg("-o")
         .arg(&publish_dir)
         .env("DOTNET_CLI_HOME", build_root.join("dotnet_home"))
@@ -96,40 +104,38 @@ fn main() {
         )
     });
 
-    let profile_dir = cargo_profile_dir(&out_dir).unwrap_or_else(|| {
-        panic!(
-            "failed to derive Cargo profile dir from OUT_DIR={}",
-            out_dir.display()
-        )
-    });
+    write_embed_file(&embed_rs, &binding_binary, &target_os);
 
-    copy_publish_output(&publish_dir, &profile_dir).unwrap_or_else(|err| {
-        panic!(
-            "failed to copy KawaiiPhysicsBinding publish output to {}: {err}",
-            profile_dir.display()
-        )
-    });
-
-    let deps_dir = profile_dir.join("deps");
-    if deps_dir.exists() {
-        copy_publish_output(&publish_dir, &deps_dir).unwrap_or_else(|err| {
+    // Local dev convenience:
+    // cargo-dist will not package this sidecar automatically, but local `cargo run`
+    // can still use the copied helper beside target/debug or target/release.
+    if let Some(profile_dir) = cargo_profile_dir(&out_dir) {
+        copy_binding_binary(&binding_binary, &profile_dir).unwrap_or_else(|err| {
             panic!(
-                "failed to copy KawaiiPhysicsBinding publish output to {}: {err}",
-                deps_dir.display()
+                "failed to copy KawaiiPhysicsBinding to {}: {err}",
+                profile_dir.display()
             )
         });
+
+        let deps_dir = profile_dir.join("deps");
+        if deps_dir.exists() {
+            copy_binding_binary(&binding_binary, &deps_dir).unwrap_or_else(|err| {
+                panic!(
+                    "failed to copy KawaiiPhysicsBinding to {}: {err}",
+                    deps_dir.display()
+                )
+            });
+        }
     }
 
-    let deployed_binary = profile_dir.join(binding_binary.file_name().unwrap());
-
     println!(
-        "cargo:warning=Built KawaiiPhysicsBinding managed exe at {}",
+        "cargo:warning=Built KawaiiPhysicsBinding managed helper at {}",
         binding_binary.display()
     );
 
     println!(
-        "cargo:warning=Copied KawaiiPhysicsBinding beside Cargo executable at {}",
-        deployed_binary.display()
+        "cargo:warning=Embedded KawaiiPhysicsBinding helper via {}",
+        embed_rs.display()
     );
 }
 
@@ -169,38 +175,65 @@ fn cargo_profile_dir(out_dir: &Path) -> Option<PathBuf> {
     out_dir.parent()?.parent()?.parent().map(Path::to_path_buf)
 }
 
-fn copy_publish_output(publish_dir: &Path, dest_dir: &Path) -> std::io::Result<()> {
+fn copy_binding_binary(src: &Path, dest_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dest_dir)?;
 
-    for entry in std::fs::read_dir(publish_dir)? {
-        let entry = entry?;
-        let src = entry.path();
-        let dst = dest_dir.join(entry.file_name());
+    let file_name = src
+        .file_name()
+        .expect("binding binary should have a file name");
 
-        if src.is_dir() {
-            copy_dir_recursive(&src, &dst)?;
-        } else {
-            std::fs::copy(&src, &dst)?;
-        }
-    }
+    let dst = dest_dir.join(file_name);
+
+    std::fs::copy(src, &dst)?;
 
     Ok(())
 }
 
-fn copy_dir_recursive(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst_dir)?;
+fn write_embed_file(embed_rs: &Path, binding_binary: &Path, target_os: &str) {
+    let binding_name = binding_binary_name(target_os);
 
-    for entry in std::fs::read_dir(src_dir)? {
-        let entry = entry?;
-        let src = entry.path();
-        let dst = dst_dir.join(entry.file_name());
+    let absolute_binding_path = binding_binary
+        .canonicalize()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to canonicalize binding binary path {}: {err}",
+                binding_binary.display()
+            )
+        });
 
-        if src.is_dir() {
-            copy_dir_recursive(&src, &dst)?;
-        } else {
-            std::fs::copy(&src, &dst)?;
-        }
-    }
+    let source = format!(
+        r#"
+// This file is generated by build.rs. Do not edit by hand.
 
-    Ok(())
+pub const KAWAII_BINDING_NAME: &str = {binding_name:?};
+
+pub static KAWAII_BINDING_BYTES: &[u8] = include_bytes!({binding_path:?});
+"#,
+        binding_name = binding_name,
+        binding_path = absolute_binding_path.to_string_lossy(),
+    );
+
+    std::fs::write(embed_rs, source).unwrap_or_else(|err| {
+        panic!(
+            "failed to write generated embed file {}: {err}",
+            embed_rs.display()
+        )
+    });
+}
+
+fn write_empty_embed_file(embed_rs: &Path) {
+    let source = r#"
+// This file is generated by build.rs. Do not edit by hand.
+
+pub const KAWAII_BINDING_NAME: &str = "";
+
+pub static KAWAII_BINDING_BYTES: &[u8] = &[];
+"#;
+
+    std::fs::write(embed_rs, source).unwrap_or_else(|err| {
+        panic!(
+            "failed to write generated empty embed file {}: {err}",
+            embed_rs.display()
+        )
+    });
 }

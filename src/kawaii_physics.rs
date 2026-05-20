@@ -1,5 +1,6 @@
 use crate::legacy_asset::FSerializedAssetBundle;
 
+
 use anyhow::{bail, Context, Result};
 use fs_err as fs;
 use std::path::{Path, PathBuf};
@@ -9,11 +10,7 @@ use typed_path::Utf8UnixPath as UEPath;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(target_os = "windows")]
-const BINDING_EXE_NAME: &str = "KawaiiPhysicsBinding.exe";
-
-#[cfg(not(target_os = "windows"))]
-const BINDING_EXE_NAME: &str = "KawaiiPhysicsBinding";
+include!(concat!(env!("OUT_DIR"), "/kawaii_binding_embed.rs"));
 
 pub struct KawaiiPhysicsBinding {
     exe_path: PathBuf,
@@ -22,15 +19,42 @@ pub struct KawaiiPhysicsBinding {
 impl KawaiiPhysicsBinding {
     pub fn load_beside_exe() -> Result<Self> {
         let exe = std::env::current_exe().context("failed to resolve current executable path")?;
-        let path = exe.with_file_name(BINDING_EXE_NAME);
+
+        if KAWAII_BINDING_NAME.is_empty() || KAWAII_BINDING_BYTES.is_empty() {
+            bail!(
+                "KawaiiPhysicsBinding was not embedded. \
+                 RETOC_SKIP_KAWAII_BINDING_BUILD may be set, or build.rs did not generate the helper."
+            );
+        }
+
+        let path = exe.with_file_name(KAWAII_BINDING_NAME);
 
         if !path.exists() {
-            bail!("KawaiiPhysics binding exe not found: {}", path.display());
+            fs::write(&path, KAWAII_BINDING_BYTES).with_context(|| {
+                format!(
+                    "failed to extract KawaiiPhysicsBinding helper to {}",
+                    path.display()
+                )
+            })?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                let mut perms = fs::metadata(&path)
+                    .with_context(|| format!("failed to stat {}", path.display()))?
+                    .permissions();
+
+                perms.set_mode(0o755);
+
+                fs::set_permissions(&path, perms)
+                    .with_context(|| format!("failed to chmod {}", path.display()))?;
+            }
         }
 
         tracing::info!(
             path = %path.display(),
-            "loaded KawaiiPhysics managed binding exe"
+            "loaded KawaiiPhysics managed binding helper"
         );
 
         Ok(Self { exe_path: path })
@@ -46,11 +70,6 @@ impl KawaiiPhysicsBinding {
 
         cmd.arg("port");
 
-        // Important:
-        // The working CLI path succeeds with USMAP=null / Mappings loaded=false.
-        // So by default we DO NOT pass the usmap to the managed binding.
-        //
-        // Set RETOC_KAWAII_PASS_USMAP=1 if you explicitly want to test the usmap path.
         if std::env::var_os("RETOC_KAWAII_PASS_USMAP").is_some() {
             if let Some(usmap_path) = usmap_path {
                 cmd.arg(usmap_path);
