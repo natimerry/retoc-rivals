@@ -830,9 +830,9 @@ impl FLegacyPackageHeader {
 
             // Might be worth moving into the enum once UE adds more data resource versions
             let data_resource_version: u32 = s.de()?;
-            if data_resource_version != 1 {
-                bail!("Unknown data resource version {}. Only EVersion::Initial (1) is supported", data_resource_version);
-            }
+            // if data_resource_version != 1 || data_resource_version != 0 {
+            //     bail!("Unknown data resource version {}. Only EVersion::Initial (1) is supported", data_resource_version);
+            // }
 
             let data_resource_count: i32 = s.de()?;
             data_resources = s.de_ctx(data_resource_count as usize)?;

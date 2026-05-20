@@ -5,6 +5,7 @@ mod container_header;
 mod file_pool;
 mod iostore;
 mod iostore_writer;
+mod kawaii_physics;
 mod legacy_asset;
 mod logging;
 mod manifest;
@@ -29,6 +30,7 @@ use iostore_writer::IoStoreWriter;
 use legacy_asset::FSerializedAssetBundle;
 use logging::Log;
 use logging::*;
+pub use logging::{reset_log_provider_to_stdout, set_log_provider, LogProvider};
 use rayon::prelude::*;
 use ser::*;
 use serde::{Deserialize, Serialize, Serializer};
@@ -51,7 +53,6 @@ use std::{
 use strum::{AsRefStr, FromRepr};
 use tracing::instrument;
 pub use version::EngineVersion;
-pub use logging::{reset_log_provider_to_stdout, set_log_provider, LogProvider};
 use zen_asset_conversion::ConvertedZenAssetBundle;
 
 /// Public function to open an IO store container
@@ -129,7 +130,7 @@ struct ActionPackRaw {
     input: PathBuf,
     #[arg(index = 2)]
     utoc: PathBuf,
-    compression: Option<CompressionMethod>
+    compression: Option<CompressionMethod>,
 }
 
 #[derive(Parser, Debug)]
@@ -201,6 +202,15 @@ pub struct ActionToZen {
     no_parallel: bool,
     pub obfuscate: bool,
     compression: Option<CompressionMethod>,
+    /// Port legacy Kawaii Physics assets into Rivals chain layout before Zen conversion.
+    #[arg(long)]
+    port_kawaii_physics: bool,
+    /// USMAP used by the Kawaii Physics porter.
+    #[arg(long)]
+    kawaii_physics_usmap: Option<PathBuf>,
+    /// Rebuild Chains[0] even if chain data already exists.
+    #[arg(long)]
+    kawaii_physics_force_rebuild: bool,
 }
 
 impl ActionToZen {
@@ -209,7 +219,12 @@ impl ActionToZen {
         self
     }
 
-    pub fn new(input: PathBuf, output: PathBuf, version: EngineVersion, compression: Option<crate::CompressionMethod>) -> Self {
+    pub fn new(
+        input: PathBuf,
+        output: PathBuf,
+        version: EngineVersion,
+        compression: Option<crate::CompressionMethod>,
+    ) -> Self {
         Self {
             input,
             output,
@@ -221,7 +236,17 @@ impl ActionToZen {
             obfuscate: false,
             // compression: Some(CompressionMethod::Oodle)
             compression,
+            port_kawaii_physics: false,
+            kawaii_physics_usmap: None,
+            kawaii_physics_force_rebuild: true,
         }
+    }
+
+    pub fn with_kawaii_physics_port(mut self, usmap: PathBuf) -> Self {
+        self.port_kawaii_physics = true;
+        self.kawaii_physics_usmap = Some(usmap);
+        self.kawaii_physics_force_rebuild = true;
+        self
     }
 }
 
@@ -691,7 +716,7 @@ fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
         None,
         manifest.mount_point.into(),
         args.compression,
-        false
+        false,
     )?;
     for entry in args.input.join("chunks").read_dir()? {
         let entry = entry?;
@@ -837,7 +862,10 @@ pub fn action_to_legacy(args: ActionToLegacy, config: Arc<Config>) -> Result<()>
     eprintln!("debug: {}", args.debug);
     eprintln!("no_parallel: {}", args.no_parallel);
     eprintln!("aes_keys count: {}", config.aes_keys.len());
-    eprintln!("container_header_version_override: {:?}", config.container_header_version_override);
+    eprintln!(
+        "container_header_version_override: {:?}",
+        config.container_header_version_override
+    );
     eprintln!("===============================");
 
     eprintln!("Creating log...");
@@ -1144,18 +1172,73 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     let container_header_version = writer.container_header_version();
     // Decide whenever we need all packages to be in memory at the same time to perform the fixup or not
     let needs_asset_import_fixup = container_header_version <= EIoContainerHeaderVersion::Initial;
+    let port_kawaii_physics = args.port_kawaii_physics || config.port_kawaii_physics;
+    let kawaii_physics_usmap = args
+        .kawaii_physics_usmap
+        .as_ref()
+        .or(config.kawaii_physics_usmap.as_ref());
+    let kawaii_physics_force_rebuild = true;
+
+    let kawaii_physics_usmap = kawaii_physics_usmap.as_deref();
+
+    let kawaii_binding = if port_kawaii_physics {
+        let Some(usmap_path) = kawaii_physics_usmap else {
+            anyhow::bail!("kawaii physics porting was enabled, but no usmap was provided");
+        };
+
+        log!(
+            &log,
+            "loading KawaiiPhysics native binding beside executable, usmap={}",
+            usmap_path.display()
+        );
+
+        Some(std::sync::Arc::new(std::sync::Mutex::new(
+            kawaii_physics::KawaiiPhysicsBinding::load_beside_exe()
+                .context("failed to load KawaiiPhysics native binding")?,
+        )))
+    } else {
+        None
+    };
 
     let process_assets = |tx: std::sync::mpsc::SyncSender<ConvertedZenAssetBundle>| -> Result<()> {
         let process = |path: &&UEPathBuf| -> Result<()> {
             verbose!(&log, "converting asset {path:?}");
 
-            let bundle = FSerializedAssetBundle {
+            let mut bundle = FSerializedAssetBundle {
                 asset_file_buffer: input.read(path)?,
                 exports_file_buffer: input.read(&path.with_extension("uexp"))?,
                 bulk_data_buffer: input.read_opt(&path.with_extension("ubulk"))?,
                 optional_bulk_data_buffer: input.read_opt(&path.with_extension("uptnl"))?,
                 memory_mapped_bulk_data_buffer: input.read_opt(&path.with_extension("m.ubulk"))?,
             };
+
+            let ue_path = UEPath::new(path.as_str());
+
+            if let Some(binding) = kawaii_binding.as_ref() {
+                if kawaii_physics::should_try_port(ue_path) {
+                    let usmap_path = kawaii_physics_usmap
+                        .expect("kawaii_physics_usmap must exist when kawaii_binding exists");
+
+                    log!(&log, "porting KawaiiPhysics data for {path:?}");
+
+                    let binding = binding.lock().map_err(|_| {
+                        anyhow::anyhow!("KawaiiPhysics native binding mutex was poisoned")
+                    })?;
+
+                    bundle = kawaii_physics::port_bundle(
+                        bundle,
+                        ue_path,
+                        Some(usmap_path),
+                        &binding,
+                        kawaii_physics_force_rebuild,
+                    )?;
+                } else {
+                    verbose!(
+                        &log,
+                        "skipping KawaiiPhysics for {path:?}, path does not match filter"
+                    );
+                }
+            }
 
             let converted = zen_asset_conversion::build_zen_asset(
                 bundle,
@@ -1251,13 +1334,18 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     result.unwrap()?;
 
     prog_ref.inspect(|p| {
-        p.finish_with_message(format!("Done: {asset_count} / {asset_count} assets converted"));
+        p.finish_with_message(format!(
+            "Done: {asset_count} / {asset_count} assets converted"
+        ));
     });
     log.set_progress(None);
 
     writer.finalize()?;
 
-    debug!(&log, "Skipping writing pak file as repak is responsible for generating the pak file");
+    debug!(
+        &log,
+        "Skipping writing pak file as repak is responsible for generating the pak file"
+    );
 
     Ok(())
 }
@@ -1344,10 +1432,24 @@ fn read_file_opt<P: AsRef<Path>>(path: P) -> Result<Option<Vec<u8>>> {
     }
 }
 
-#[derive(Default)]
 pub struct Config {
     pub aes_keys: HashMap<FGuid, AesKey>,
     pub container_header_version_override: Option<EIoContainerHeaderVersion>,
+    pub port_kawaii_physics: bool,
+    pub kawaii_physics_usmap: Option<PathBuf>,
+    pub kawaii_physics_force_rebuild: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            aes_keys: HashMap::new(),
+            container_header_version_override: None,
+            port_kawaii_physics: false,
+            kawaii_physics_usmap: None,
+            kawaii_physics_force_rebuild: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

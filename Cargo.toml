@@ -21,6 +21,7 @@ indexmap = { version = "2.7.0", features = ["serde"] }
 indicatif = "0.17.9"
 itertools = "0.14.0"
 key-mutex = "0.1.3"
+libloading = "0.9.0"
 lz4_flex = "0.11.3"
 oodle_loader = { path = "../oodle_loader"}
 pariter = "0.5.1"
@@ -36,6 +37,8 @@ tracing = "0.1.41"
 typed-path = "0.10.0"
 ue_reflection = { git = "https://github.com/trumank/meatloaf.git", version = "0.1.0" }
 zstd = "0.13.2"
+
+[build-dependencies]
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
