@@ -4,8 +4,14 @@ use anyhow::{bail, Context, Result};
 use fs_err as fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use typed_path::Utf8UnixPath as UEPath;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -64,8 +70,12 @@ impl KawaiiPhysicsBinding {
         usmap_path: Option<&Path>,
         uasset_path: &Path,
         force_rebuild: bool,
+        ported_count: &AtomicUsize,
     ) -> Result<i32> {
         let mut cmd = Command::new(&self.exe_path);
+
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
 
         cmd.arg("port");
 
@@ -103,8 +113,9 @@ impl KawaiiPhysicsBinding {
         let ported = parse_ported_count(&stdout)
             .or_else(|| parse_ported_count(&stderr))
             .unwrap_or(0);
+        ported_count.fetch_add(ported as usize, Ordering::Relaxed);
 
-        tracing::debug!(
+        tracing::trace!(
             ported_anim_nodes = ported,
             stdout = %stdout,
             stderr = %stderr,
@@ -138,6 +149,7 @@ pub(crate) fn port_bundle(
     usmap_path: Option<&Path>,
     binding: &KawaiiPhysicsBinding,
     force_rebuild: bool,
+    total_ported: &AtomicUsize,
 ) -> Result<FSerializedAssetBundle> {
     let temp_dir = make_temp_dir()?;
 
@@ -171,8 +183,8 @@ pub(crate) fn port_bundle(
         )
         .with_context(|| format!("failed to write temp m.ubulk {}", mubulk_path.display()))?;
 
-        let ported = binding
-            .port_asset(usmap_path, &uasset_path, force_rebuild)
+        let _ = binding
+            .port_asset(usmap_path, &uasset_path, force_rebuild, total_ported)
             .with_context(|| format!("failed to port KawaiiPhysics asset {path}"))?;
 
         bundle.asset_file_buffer = fs::read(&uasset_path)
@@ -189,12 +201,6 @@ pub(crate) fn port_bundle(
 
         bundle.memory_mapped_bulk_data_buffer = read_optional_if_exists(&mubulk_path)
             .with_context(|| format!("failed to read patched m.ubulk {}", mubulk_path.display()))?;
-
-        tracing::debug!(
-            path = %path,
-            ported_anim_nodes = ported,
-            "KawaiiPhysics bundle port finished"
-        );
 
         Ok(bundle)
     })();

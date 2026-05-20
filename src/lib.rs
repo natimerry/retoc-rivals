@@ -1277,6 +1277,7 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         None
     };
 
+    let total_ported = AtomicUsize::new(0);
     let process_assets = |tx: std::sync::mpsc::SyncSender<ConvertedZenAssetBundle>| -> Result<()> {
         let process = |path: &&UEPathBuf| -> Result<()> {
             verbose!(&log, "converting asset {path:?}");
@@ -1308,12 +1309,8 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
                         Some(usmap_path),
                         &binding,
                         kawaii_physics_force_rebuild,
+                        &total_ported,
                     )?;
-                } else {
-                    verbose!(
-                        &log,
-                        "skipping KawaiiPhysics for {path:?}, path does not match filter"
-                    );
                 }
             }
 
@@ -1422,6 +1419,11 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     debug!(
         &log,
         "Skipping writing pak file as repak is responsible for generating the pak file"
+    );
+
+    info!(
+        "Ported a total of {} KawaiiPhysics assets",
+        total_ported.load(Ordering::Relaxed)
     );
 
     Ok(())
