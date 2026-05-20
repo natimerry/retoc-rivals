@@ -69,10 +69,8 @@ impl KawaiiPhysicsBinding {
 
         cmd.arg("port");
 
-        if std::env::var_os("RETOC_KAWAII_PASS_USMAP").is_some() {
-            if let Some(usmap_path) = usmap_path {
-                cmd.arg(usmap_path);
-            }
+        if let Some(usmap_path) = usmap_path {
+            cmd.arg(usmap_path);
         }
 
         cmd.arg(uasset_path);
