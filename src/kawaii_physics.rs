@@ -126,11 +126,13 @@ pub(crate) fn should_try_port(path: &UEPath) -> bool {
     // It patched both:
     // - ABP_NudePhysicsLobby.uasset
     // - Post_1053001_Physics.uasset
-    path.contains("physics")
-        || file_name.starts_with("abp_")
-        || path.contains("/abp_")
-        || path.contains("/animation/")
-        || path.contains("/animations/")
+    // path.contains("physics")
+    //     || file_name.starts_with("abp_")
+    //     || path.contains("/abp_")
+    //     || path.contains("/animation/")
+    //     || path.contains("/animations/")
+
+    true
 }
 
 pub(crate) fn port_bundle(
