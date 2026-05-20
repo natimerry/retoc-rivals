@@ -30,5 +30,5 @@ pub struct PackageStoreEntry {
 pub struct ChunkData {
     #[serde_as(as = "serde_with::hex::Hex")]
     pub id: FIoChunkIdRaw,
-    pub  filename: String,
+    pub filename: String,
 }

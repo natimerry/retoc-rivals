@@ -1,10 +1,9 @@
-use std::{
-    io::{BufWriter, Seek, Write},
-    path::{Path, PathBuf},
-};
-use std::str::FromStr;
 use crate::{
-    AesKey, EIoChunkType, FPackageId, UEPath, UEPathBuf, align_usize, chunk_id::FIoChunkIdRaw, compression::{CompressionMethod, compress}, container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry}
+    align_usize,
+    chunk_id::FIoChunkIdRaw,
+    compression::{compress, CompressionMethod},
+    container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry},
+    AesKey, EIoChunkType, FPackageId, UEPath, UEPathBuf,
 };
 use crate::{
     ser::*, EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FIoContainerId, FIoOffsetAndLength,
@@ -12,6 +11,11 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use fs_err as fs;
+use std::str::FromStr;
+use std::{
+    io::{BufWriter, Seek, Write},
+    path::{Path, PathBuf},
+};
 
 pub(crate) struct IoStoreWriter {
     toc_path: PathBuf,
@@ -35,7 +39,7 @@ impl IoStoreWriter {
         container_header_version: Option<EIoContainerHeaderVersion>,
         mount_point: UEPathBuf,
         compression: Option<CompressionMethod>,
-        obfuscated: bool
+        obfuscated: bool,
     ) -> Result<Self> {
         let toc_path = toc_path.as_ref().to_path_buf();
         let name = toc_path.file_stem().unwrap().to_string_lossy();
@@ -49,7 +53,7 @@ impl IoStoreWriter {
         toc.directory_index.mount_point = mount_point;
         toc.partition_size = u64::MAX;
 
-        if obfuscated{
+        if obfuscated {
             toc.set_obfuscated(true);
         }
 
@@ -58,10 +62,8 @@ impl IoStoreWriter {
             toc.container_flags |= crate::EIoContainerFlags::Compressed
         }
 
-
         let container_header =
             container_header_version.map(|v| FIoContainerHeader::new(v, toc.container_id));
-
 
         Ok(Self {
             toc_path,
@@ -70,7 +72,7 @@ impl IoStoreWriter {
             toc,
             container_header,
             compression,
-            obfuscated
+            obfuscated,
         })
     }
     pub(crate) fn write_chunk_raw(
@@ -86,18 +88,39 @@ impl IoStoreWriter {
         )
     }
 
-    pub fn write_chunk(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
+    pub fn write_chunk(
+        &mut self,
+        chunk_id: FIoChunkId,
+        path: Option<&UEPath>,
+        data: &[u8],
+    ) -> Result<()> {
         self.write_chunk_inner(chunk_id, path, data, self.compression)
     }
 
-    pub fn write_chunk_uncompressed(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
+    pub fn write_chunk_uncompressed(
+        &mut self,
+        chunk_id: FIoChunkId,
+        path: Option<&UEPath>,
+        data: &[u8],
+    ) -> Result<()> {
         self.write_chunk_inner(chunk_id, path, data, None)
     }
 
-    fn write_chunk_inner(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8], compression: Option<CompressionMethod>) -> Result<()> {
+    fn write_chunk_inner(
+        &mut self,
+        chunk_id: FIoChunkId,
+        path: Option<&UEPath>,
+        data: &[u8],
+        compression: Option<CompressionMethod>,
+    ) -> Result<()> {
         if let Some(path) = path {
             let index = &mut self.toc.directory_index;
-            let relative_path = path.strip_prefix(&index.mount_point).with_context(|| format!("mount point {} does not contain path {path}", index.mount_point))?;
+            let relative_path = path.strip_prefix(&index.mount_point).with_context(|| {
+                format!(
+                    "mount point {} does not contain path {path}",
+                    index.mount_point
+                )
+            })?;
             index.add_file(relative_path, self.toc.chunks.len() as u32);
         }
 
@@ -122,14 +145,13 @@ impl IoStoreWriter {
                 None => (block.to_vec(), 0u8),
             };
 
-
             let compressed_size = bytes_to_write.len() as u32;
             let uncompressed_size = block.len() as u32;
 
-
             let final_bytes = if self.obfuscated {
                 use aes::cipher::BlockEncrypt;
-                const DEFAULT_AES_KEY: &str = "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74";
+                const DEFAULT_AES_KEY: &str =
+                    "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74";
                 let key: AesKey = DEFAULT_AES_KEY.parse()?;
                 let padded_len = (bytes_to_write.len() + 15) & !15;
                 let mut padded = bytes_to_write;
@@ -146,13 +168,14 @@ impl IoStoreWriter {
             self.cas_stream.write_all(&final_bytes)?;
             let written_size = final_bytes.len() as u32;
 
-
-            self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(
-                offset,
-                compressed_size,
-                uncompressed_size,
-                compression_method_index,
-            ));
+            self.toc
+                .compression_blocks
+                .push(FIoStoreTocCompressedBlockEntry::new(
+                    offset,
+                    compressed_size,
+                    uncompressed_size,
+                    compression_method_index,
+                ));
 
             offset += written_size as u64;
         }
@@ -168,7 +191,9 @@ impl IoStoreWriter {
             start_block as u64 * self.toc.compression_block_size as u64,
             data.len() as u64,
         );
-        self.toc.chunks.push(chunk_id.with_version(self.toc.version));
+        self.toc
+            .chunks
+            .push(chunk_id.with_version(self.toc.version));
         self.toc.chunk_offset_lengths.push(offset_and_length);
         self.toc.chunk_metas.push(meta);
 

@@ -21,9 +21,8 @@ fn main() {
         return;
     }
 
-    let manifest_dir = PathBuf::from(
-        env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR was not set"),
-    );
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR was not set"));
 
     let project = manifest_dir
         .parent()
@@ -33,7 +32,10 @@ fn main() {
         .join("KawaiiPhysicsBinding.csproj");
 
     if !project.exists() {
-        panic!("KawaiiPhysicsBinding project not found: {}", project.display());
+        panic!(
+            "KawaiiPhysicsBinding project not found: {}",
+            project.display()
+        );
     }
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("missing CARGO_CFG_TARGET_OS");
@@ -192,14 +194,12 @@ fn copy_binding_binary(src: &Path, dest_dir: &Path) -> std::io::Result<()> {
 fn write_embed_file(embed_rs: &Path, binding_binary: &Path, target_os: &str) {
     let binding_name = binding_binary_name(target_os);
 
-    let absolute_binding_path = binding_binary
-        .canonicalize()
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to canonicalize binding binary path {}: {err}",
-                binding_binary.display()
-            )
-        });
+    let absolute_binding_path = binding_binary.canonicalize().unwrap_or_else(|err| {
+        panic!(
+            "failed to canonicalize binding binary path {}: {err}",
+            binding_binary.display()
+        )
+    });
 
     let source = format!(
         r#"

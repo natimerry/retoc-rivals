@@ -1,13 +1,16 @@
-use crate::zen::{EUnrealEngineObjectUE4Version, EUnrealEngineObjectUE5Version, FCustomVersion, FPackageFileVersion, FPackageIndex};
-use crate::{break_down_name_string, ser::*, FGuid};
 use crate::logging::*;
+use crate::version_heuristics::heuristic_package_version_from_legacy_package;
+use crate::zen::{
+    EUnrealEngineObjectUE4Version, EUnrealEngineObjectUE5Version, FCustomVersion,
+    FPackageFileVersion, FPackageIndex,
+};
+use crate::{break_down_name_string, ser::*, FGuid};
 use anyhow::{bail, Result};
 use std::borrow::Cow;
 use std::cmp::max;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use tracing::instrument;
-use crate::version_heuristics::heuristic_package_version_from_legacy_package;
 
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct FMinimalName {
@@ -40,9 +43,9 @@ pub(crate) struct FCountOffsetPair {
 impl Readable for FCountOffsetPair {
     #[instrument(skip_all, name = "FCountOffsetPair")]
     fn de<S: Read>(s: &mut S) -> Result<Self> {
-        Ok(Self{
+        Ok(Self {
             count: s.de()?,
-            offset: s.de()?
+            offset: s.de()?,
         })
     }
 }
@@ -63,9 +66,9 @@ struct FGenerationInfo {
 impl Readable for FGenerationInfo {
     #[instrument(skip_all, name = "FGenerationInfo")]
     fn de<S: Read>(s: &mut S) -> Result<Self> {
-        Ok(Self{
+        Ok(Self {
             export_count: s.de()?,
-            name_count: s.de()?
+            name_count: s.de()?,
         })
     }
 }
@@ -89,12 +92,12 @@ pub(crate) struct FEngineVersion {
 impl Readable for FEngineVersion {
     #[instrument(skip_all, name = "FEngineVersion")]
     fn de<S: Read>(s: &mut S) -> Result<Self> {
-        Ok(Self{
+        Ok(Self {
             engine_major: s.de()?,
             engine_minor: s.de()?,
             engine_patch: s.de()?,
             changelist: s.de()?,
-            branch: s.de()?
+            branch: s.de()?,
         })
     }
 }
@@ -111,8 +114,7 @@ impl Writeable for FEngineVersion {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct FLegacyPackageVersioningInfo
-{
+pub(crate) struct FLegacyPackageVersioningInfo {
     pub(crate) legacy_file_version: i32,
     pub(crate) package_file_version: FPackageFileVersion,
     pub(crate) licensee_version: i32,
@@ -128,38 +130,63 @@ impl Readable for FLegacyPackageVersioningInfo {
     fn de<S: Read>(s: &mut S) -> Result<Self> {
         // We can only read latest UE4 packages (4.26+) and UE5 packages, bail out if the package is too old
         let legacy_file_version: i32 = s.de()?;
-        if legacy_file_version != FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE4 && legacy_file_version != FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE5 {
+        if legacy_file_version != FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE4
+            && legacy_file_version != FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE5
+        {
             bail!("Package file version too old: {} (Supported versions are {} for UE4 and {} for UE5)", legacy_file_version, FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE4, FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE5);
         }
 
         // There should never be a UE3 version written here
         let legacy_ue3_version: i32 = s.de()?;
         if legacy_ue3_version != 0 {
-            bail!("Expected to find zero UE3 version, got {}", legacy_ue3_version);
+            bail!(
+                "Expected to find zero UE3 version, got {}",
+                legacy_ue3_version
+            );
         }
 
         // Read raw file version for UE4 and UE5 (if package is UE5)
         let raw_file_version_ue4: i32 = s.de()?;
-        let raw_file_version_ue5: i32 = if legacy_file_version == FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE5 { s.de()? } else { 0 };
-        let package_file_version = FPackageFileVersion{file_version_ue4: raw_file_version_ue4, file_version_ue5: raw_file_version_ue5};
+        let raw_file_version_ue5: i32 =
+            if legacy_file_version == FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE5 {
+                s.de()?
+            } else {
+                0
+            };
+        let package_file_version = FPackageFileVersion {
+            file_version_ue4: raw_file_version_ue4,
+            file_version_ue5: raw_file_version_ue5,
+        };
 
         let licensee_version: i32 = s.de()?;
         let custom_versions: Vec<FCustomVersion> = s.de()?;
-        let is_unversioned = raw_file_version_ue4 == 0 && raw_file_version_ue5 == 0 && licensee_version == 0 && custom_versions.is_empty();
+        let is_unversioned = raw_file_version_ue4 == 0
+            && raw_file_version_ue5 == 0
+            && licensee_version == 0
+            && custom_versions.is_empty();
 
-        Ok(Self{legacy_file_version, package_file_version, licensee_version, custom_versions, is_unversioned})
+        Ok(Self {
+            legacy_file_version,
+            package_file_version,
+            licensee_version,
+            custom_versions,
+            is_unversioned,
+        })
     }
 }
 impl Writeable for FLegacyPackageVersioningInfo {
     fn ser<S: Write>(&self, s: &mut S) -> Result<()> {
-
         // We need to at the very least have UE4 file version to write legacy package versioning info
         if self.package_file_version.file_version_ue4 == 0 {
             bail!("Cannot serialize package versioning info without UE4 file version");
         }
 
         // Derive legacy file version from the presence of UE5 file version
-        let legacy_file_version: i32 = if self.package_file_version.file_version_ue5 != 0 { FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE5 } else { FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE4 };
+        let legacy_file_version: i32 = if self.package_file_version.file_version_ue5 != 0 {
+            FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE5
+        } else {
+            FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE4
+        };
         s.ser(&legacy_file_version)?;
 
         // There should never be a UE3 version written
@@ -168,14 +195,26 @@ impl Writeable for FLegacyPackageVersioningInfo {
 
         // Write raw file version for UE4 and UE5 (if package is UE5)
         // Note that we should not write any versions if this package was loaded as unversioned, since our own version is only used internally and the game should still assume latest
-        let raw_file_version_ue4: i32 = if self.is_unversioned { 0 } else { self.package_file_version.file_version_ue4 };
+        let raw_file_version_ue4: i32 = if self.is_unversioned {
+            0
+        } else {
+            self.package_file_version.file_version_ue4
+        };
         s.ser(&raw_file_version_ue4)?;
         if legacy_file_version == FLegacyPackageVersioningInfo::LEGACY_FILE_VERSION_UE5 {
-            let raw_file_version_ue5: i32 = if self.is_unversioned { 0 } else { self.package_file_version.file_version_ue5 };
+            let raw_file_version_ue5: i32 = if self.is_unversioned {
+                0
+            } else {
+                self.package_file_version.file_version_ue5
+            };
             s.ser(&raw_file_version_ue5)?;
         }
 
-        let licensee_version = if self.is_unversioned { 0 } else { self.licensee_version };
+        let licensee_version = if self.is_unversioned {
+            0
+        } else {
+            self.licensee_version
+        };
         s.ser(&licensee_version)?;
         s.ser(&self.custom_versions.clone())?;
         Ok(())
@@ -191,8 +230,7 @@ pub(crate) enum EPackageFlags {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct FLegacyPackageFileSummary
-{
+pub(crate) struct FLegacyPackageFileSummary {
     pub(crate) versioning_info: FLegacyPackageVersioningInfo,
     pub(crate) total_header_size: i32,
     pub(crate) package_name: String,
@@ -218,18 +256,30 @@ pub(crate) struct FLegacyPackageFileSummary
 }
 impl FLegacyPackageFileSummary {
     pub(crate) const PACKAGE_FILE_TAG: u32 = 0x9E2A83C1;
-    pub(crate) fn has_package_flags(&self, package_flags: EPackageFlags) -> bool { (self.package_flags & package_flags as u32) != 0 }
-    pub(crate) fn is_filter_editor_only(&self) -> bool { self.has_package_flags(EPackageFlags::FilterEditorOnly) }
-    pub(crate) fn uses_unversioned_property_serialization(&self) -> bool { self.has_package_flags(EPackageFlags::UsesUnversionedProperties) }
+    pub(crate) fn has_package_flags(&self, package_flags: EPackageFlags) -> bool {
+        (self.package_flags & package_flags as u32) != 0
+    }
+    pub(crate) fn is_filter_editor_only(&self) -> bool {
+        self.has_package_flags(EPackageFlags::FilterEditorOnly)
+    }
+    pub(crate) fn uses_unversioned_property_serialization(&self) -> bool {
+        self.has_package_flags(EPackageFlags::UsesUnversionedProperties)
+    }
 }
 impl FLegacyPackageFileSummary {
     #[instrument(skip_all, name = "FLegacyPackageFileSummary")]
-    pub(crate) fn deserialize<S: Read>(s: &mut S, package_version_fallback: Option<FPackageFileVersion>) -> Result<Self> {
-
+    pub(crate) fn deserialize<S: Read>(
+        s: &mut S,
+        package_version_fallback: Option<FPackageFileVersion>,
+    ) -> Result<Self> {
         // Check asset magic first
         let asset_magic_tag: u32 = s.de()?;
         if asset_magic_tag != FLegacyPackageFileSummary::PACKAGE_FILE_TAG {
-            bail!("Package file magic mismatch: {} (expected {})", asset_magic_tag, FLegacyPackageFileSummary::PACKAGE_FILE_TAG);
+            bail!(
+                "Package file magic mismatch: {} (expected {})",
+                asset_magic_tag,
+                FLegacyPackageFileSummary::PACKAGE_FILE_TAG
+            );
         }
 
         let mut versioning_info: FLegacyPackageVersioningInfo = s.de()?;
@@ -241,7 +291,9 @@ impl FLegacyPackageFileSummary {
             versioning_info.package_file_version = package_version_fallback.unwrap();
         }
         // Make sure we are not attempting to read versions before UE4 NonOuterPackageImport. Our export/import serialization does not support such old versions
-        if versioning_info.package_file_version.file_version_ue4 < EUnrealEngineObjectUE4Version::NonOuterPackageImport as i32 {
+        if versioning_info.package_file_version.file_version_ue4
+            < EUnrealEngineObjectUE4Version::NonOuterPackageImport as i32
+        {
             bail!("Encountered UE4 package file version {}, which is below minimum supported version {}", versioning_info.package_file_version.file_version_ue4, EUnrealEngineObjectUE4Version::NonOuterPackageImport as i32);
         }
 
@@ -252,10 +304,21 @@ impl FLegacyPackageFileSummary {
         let is_filter_editor_only = (package_flags & EPackageFlags::FilterEditorOnly as u32) != 0;
 
         let names: FCountOffsetPair = s.de()?;
-        let soft_object_paths: FCountOffsetPair = if versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::AddSoftObjectPathList as i32 { s.de()? } else { FCountOffsetPair::default() };
+        let soft_object_paths: FCountOffsetPair =
+            if versioning_info.package_file_version.file_version_ue5
+                >= EUnrealEngineObjectUE5Version::AddSoftObjectPathList as i32
+            {
+                s.de()?
+            } else {
+                FCountOffsetPair::default()
+            };
 
         // Not written when editor only data is filtered out
-        let _localization_id: String = if !is_filter_editor_only { s.de()? } else { "".to_string() };
+        let _localization_id: String = if !is_filter_editor_only {
+            s.de()?
+        } else {
+            "".to_string()
+        };
         // Not written when cooking or filtering editor only data
         let _gatherable_text_data: FCountOffsetPair = s.de()?;
 
@@ -270,10 +333,14 @@ impl FLegacyPackageFileSummary {
         // Cooked packages do not have thumbnails ever, no point in saving this
         let _thumbnail_table_offset: i32 = s.de()?;
 
-        let package_guid : FGuid = s.de()?;
+        let package_guid: FGuid = s.de()?;
 
         // Package generations are always 0,0 for modern packages, persistent package GUID is never written for cooked packages
-        let _persistent_package_guid: FGuid = if !is_filter_editor_only { s.de()? } else { FGuid::default() };
+        let _persistent_package_guid: FGuid = if !is_filter_editor_only {
+            s.de()?
+        } else {
+            FGuid::default()
+        };
         let _package_generations: Vec<FGenerationInfo> = s.de()?;
 
         // These are always empty for cooked packages, so no point in saving them
@@ -283,7 +350,10 @@ impl FLegacyPackageFileSummary {
         // Unused, always 0 for modern packages
         let compression_flags: u32 = s.de()?;
         if compression_flags != 0 {
-           bail!("Expected 0 legacy compression flags when reading a package, got {}", compression_flags);
+            bail!(
+                "Expected 0 legacy compression flags when reading a package, got {}",
+                compression_flags
+            );
         }
         // This is not supported by the UE itself, so no point in trying to read full TArray<FCompressedChunk>
         // FCompressedChunk definition for reference: uncompressed_offset: i32, uncompressed_size: i32, compressed_offset: i32, compressed_size: i32
@@ -309,15 +379,34 @@ impl FLegacyPackageFileSummary {
         let preload_dependencies: FCountOffsetPair = s.de()?;
 
         // Assume all names are referenced if this is an old package
-        let names_referenced_from_export_data_count: i32 = if versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::NamesReferencedFromExportData as i32 { s.de()? } else { names.count };
+        let names_referenced_from_export_data_count: i32 =
+            if versioning_info.package_file_version.file_version_ue5
+                >= EUnrealEngineObjectUE5Version::NamesReferencedFromExportData as i32
+            {
+                s.de()?
+            } else {
+                names.count
+            };
 
         // Package trailers should never be written for cooked packages, they are only used for saving EditorBulkData in editor domain with package virtualization
-        let _payload_toc_offset: i64 = if versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::PayloadTOC as i32 { s.de()? } else { -1 };
+        let _payload_toc_offset: i64 = if versioning_info.package_file_version.file_version_ue5
+            >= EUnrealEngineObjectUE5Version::PayloadTOC as i32
+        {
+            s.de()?
+        } else {
+            -1
+        };
 
         // Data resource offset is only written with new bulk data save format, otherwise bulk data meta is simply saved inline
-        let data_resource_offset: i32 = if versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::DataResources as i32 { s.de()? } else { -1 };
+        let data_resource_offset: i32 = if versioning_info.package_file_version.file_version_ue5
+            >= EUnrealEngineObjectUE5Version::DataResources as i32
+        {
+            s.de()?
+        } else {
+            -1
+        };
 
-        Ok(FLegacyPackageFileSummary{
+        Ok(FLegacyPackageFileSummary {
             versioning_info,
             total_header_size,
             package_name,
@@ -341,12 +430,23 @@ impl FLegacyPackageFileSummary {
 
     // Deserializes all the information that can be safely deserialized without knowing the package version
     #[instrument(skip_all, name = "FLegacyPackageFileSummary - Minimal")]
-    pub(crate) fn deserialize_summary_minimal_version_independent<S: Read>(s: &mut S) -> Result<(FLegacyPackageVersioningInfo, FCountOffsetPair, String, i32, u32)> {
-
+    pub(crate) fn deserialize_summary_minimal_version_independent<S: Read>(
+        s: &mut S,
+    ) -> Result<(
+        FLegacyPackageVersioningInfo,
+        FCountOffsetPair,
+        String,
+        i32,
+        u32,
+    )> {
         // Check asset magic first
         let asset_magic_tag: u32 = s.de()?;
         if asset_magic_tag != FLegacyPackageFileSummary::PACKAGE_FILE_TAG {
-            bail!("Package file magic mismatch: {} (expected {})", asset_magic_tag, FLegacyPackageFileSummary::PACKAGE_FILE_TAG);
+            bail!(
+                "Package file magic mismatch: {} (expected {})",
+                asset_magic_tag,
+                FLegacyPackageFileSummary::PACKAGE_FILE_TAG
+            );
         }
 
         let versioning_info: FLegacyPackageVersioningInfo = s.de()?;
@@ -355,17 +455,24 @@ impl FLegacyPackageFileSummary {
         let package_flags: u32 = s.de()?;
 
         let names: FCountOffsetPair = s.de()?;
-        Ok((versioning_info, names, package_name, total_header_size, package_flags))
+        Ok((
+            versioning_info,
+            names,
+            package_name,
+            total_header_size,
+            package_flags,
+        ))
     }
 
     #[instrument(skip_all, name = "FLegacyPackageFileSummary")]
     fn serialize<S: Write>(&self, s: &mut S) -> Result<()> {
-
         let asset_magic_tag: u32 = FLegacyPackageFileSummary::PACKAGE_FILE_TAG;
         s.ser(&asset_magic_tag)?;
 
         // Make sure we are not attempting to write versions before UE4 NonOuterPackageImport. Our export/import serialization does not support such old versions
-        if self.versioning_info.package_file_version.file_version_ue4 < EUnrealEngineObjectUE4Version::NonOuterPackageImport as i32 {
+        if self.versioning_info.package_file_version.file_version_ue4
+            < EUnrealEngineObjectUE4Version::NonOuterPackageImport as i32
+        {
             bail!("Attempt to write UE4 package file version {}, which is below minimum supported version {}", self.versioning_info.package_file_version.file_version_ue4, EUnrealEngineObjectUE4Version::NonOuterPackageImport as i32);
         }
 
@@ -375,7 +482,9 @@ impl FLegacyPackageFileSummary {
         s.ser(&self.package_flags)?;
 
         s.ser(&self.names)?;
-        if self.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::AddSoftObjectPathList as i32 {
+        if self.versioning_info.package_file_version.file_version_ue5
+            >= EUnrealEngineObjectUE5Version::AddSoftObjectPathList as i32
+        {
             s.ser(&self.soft_object_paths)?;
         }
 
@@ -385,7 +494,10 @@ impl FLegacyPackageFileSummary {
             s.ser(&localization_id)?;
         }
         // Not written when cooking or filtering editor only data
-        let gatherable_text_data = FCountOffsetPair{count: 0, offset: 0};
+        let gatherable_text_data = FCountOffsetPair {
+            count: 0,
+            offset: 0,
+        };
         s.ser(&gatherable_text_data)?;
 
         s.ser(&self.exports)?;
@@ -394,7 +506,10 @@ impl FLegacyPackageFileSummary {
         s.ser(&self.depends_offset)?;
 
         // Cooked packages never have soft package references or searchable names
-        let soft_package_references = FCountOffsetPair{count: 0, offset: 0};
+        let soft_package_references = FCountOffsetPair {
+            count: 0,
+            offset: 0,
+        };
         s.ser(&soft_package_references)?;
         let searchable_names_offset: i32 = 0;
         s.ser(&searchable_names_offset)?;
@@ -406,17 +521,37 @@ impl FLegacyPackageFileSummary {
 
         // Package generations are always saved as one entry for modern packages, but not used in runtime
         // Note that the FLinkerLoad expects there to still be a single generation, it will crash if there is none
-        let package_generations: Vec<FGenerationInfo> = vec![FGenerationInfo{export_count: self.exports.count, name_count: self.names.count}];
+        let package_generations: Vec<FGenerationInfo> = vec![FGenerationInfo {
+            export_count: self.exports.count,
+            name_count: self.names.count,
+        }];
         s.ser(&package_generations)?;
         // Persistent package GUID is never written for cooked packages
         if !self.is_filter_editor_only() {
-            let persistent_package_guid = FGuid{a: 0, b: 0, c: 0, d: 0};
+            let persistent_package_guid = FGuid {
+                a: 0,
+                b: 0,
+                c: 0,
+                d: 0,
+            };
             s.ser(&persistent_package_guid)?;
         }
 
         // Saved and compatible engine versions are always empty for cooked packages
-        let saved_by_engine_version = FEngineVersion{engine_major: 0, engine_minor: 0, engine_patch: 0, changelist: 0, branch: "".to_string()};
-        let compatible_with_engine_version = FEngineVersion{engine_major: 0, engine_minor: 0, engine_patch: 0, changelist: 0, branch: "".to_string()};
+        let saved_by_engine_version = FEngineVersion {
+            engine_major: 0,
+            engine_minor: 0,
+            engine_patch: 0,
+            changelist: 0,
+            branch: "".to_string(),
+        };
+        let compatible_with_engine_version = FEngineVersion {
+            engine_major: 0,
+            engine_minor: 0,
+            engine_patch: 0,
+            changelist: 0,
+            branch: "".to_string(),
+        };
         s.ser(&saved_by_engine_version)?;
         s.ser(&compatible_with_engine_version)?;
 
@@ -444,16 +579,26 @@ impl FLegacyPackageFileSummary {
         s.ser(&self.preload_dependencies)?;
 
         // Only write number of referenced names if this is a UE5 package
-        if self.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::NamesReferencedFromExportData as i32 { s.ser(&self.names_referenced_from_export_data_count)?; }
+        if self.versioning_info.package_file_version.file_version_ue5
+            >= EUnrealEngineObjectUE5Version::NamesReferencedFromExportData as i32
+        {
+            s.ser(&self.names_referenced_from_export_data_count)?;
+        }
 
         // Package trailers should never be written for cooked packages, they are only used for saving EditorBulkData in editor domain with package virtualization
-        if self.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::PayloadTOC as i32 {
+        if self.versioning_info.package_file_version.file_version_ue5
+            >= EUnrealEngineObjectUE5Version::PayloadTOC as i32
+        {
             let payload_toc_offset: i64 = -1;
             s.ser(&payload_toc_offset)?;
         }
 
         // Data resource offset is only written with new bulk data save format, otherwise bulk data meta is simply saved inline
-        if self.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::DataResources as i32 { s.ser(&self.data_resource_offset)?; }
+        if self.versioning_info.package_file_version.file_version_ue5
+            >= EUnrealEngineObjectUE5Version::DataResources as i32
+        {
+            s.ser(&self.data_resource_offset)?;
+        }
 
         Ok(())
     }
@@ -465,25 +610,34 @@ pub(crate) struct FPackageNameMap {
     name_lookup: HashMap<String, usize>,
 }
 impl FPackageNameMap {
-    pub(crate) fn create() -> Self { FPackageNameMap{ names: Vec::new(), name_lookup: HashMap::new() } }
+    pub(crate) fn create() -> Self {
+        FPackageNameMap {
+            names: Vec::new(),
+            name_lookup: HashMap::new(),
+        }
+    }
     pub(crate) fn create_from_names(names: Vec<String>) -> Self {
         let mut name_lookup: HashMap<String, usize> = HashMap::with_capacity(names.len());
         for (name_index, name) in names.iter().cloned().enumerate() {
             name_lookup.insert(name, name_index);
         }
-        Self{names, name_lookup}
+        Self { names, name_lookup }
     }
-    pub(crate) fn num_names(&self) -> usize { self.names.len() }
+    pub(crate) fn num_names(&self) -> usize {
+        self.names.len()
+    }
     #[instrument(skip_all, name = "FPackageNameMap")]
-    pub(crate) fn read<S: Read + Seek>(stream: &mut S, summary: &FLegacyPackageFileSummary) -> Result<FPackageNameMap> {
-
+    pub(crate) fn read<S: Read + Seek>(
+        stream: &mut S,
+        summary: &FLegacyPackageFileSummary,
+    ) -> Result<FPackageNameMap> {
         stream.seek(SeekFrom::Start(summary.names.offset as u64))?;
 
         let mut names: Vec<String> = Vec::with_capacity(summary.names.count as usize);
-        let mut name_lookup: HashMap<String, usize> = HashMap::with_capacity(summary.names.count as usize);
+        let mut name_lookup: HashMap<String, usize> =
+            HashMap::with_capacity(summary.names.count as usize);
 
         for index in 0..summary.names.count {
-
             let name_string: String = stream.de()?;
             let _non_case_preserving_hash: u16 = stream.de()?;
             let _case_preserving_hash: u16 = stream.de()?;
@@ -492,17 +646,20 @@ impl FPackageNameMap {
             name_lookup.insert(name_string, index as usize);
         }
 
-        Ok(Self{names, name_lookup})
+        Ok(Self { names, name_lookup })
     }
     #[instrument(skip_all, name = "FPackageNameMap")]
-    pub(crate) fn write<S: Write + Seek>(&self, stream: &mut S, summary: &mut FLegacyPackageFileSummary, package_summary_offset: u64) -> Result<()> {
-
+    pub(crate) fn write<S: Write + Seek>(
+        &self,
+        stream: &mut S,
+        summary: &mut FLegacyPackageFileSummary,
+        package_summary_offset: u64,
+    ) -> Result<()> {
         // Tell the summary where the names start and how many there are
         summary.names.offset = (stream.stream_position()? - package_summary_offset) as i32;
         summary.names.count = self.names.len() as i32;
 
         for i in 0..self.names.len() {
-
             // Write the name string
             stream.ser(&self.names[i].clone())?;
 
@@ -530,16 +687,25 @@ impl FPackageNameMap {
 
         // Attempt to resolve the existing name through lookup
         if let Some(existing_index) = self.name_lookup.get(name_without_number) {
-            return FMinimalName{ index: *existing_index as i32, number: name_number };
+            return FMinimalName {
+                index: *existing_index as i32,
+                number: name_number,
+            };
         }
 
         // Create a new name and add it to the names list and to the name lookup
         let new_name_index = self.names.len();
-        self.name_lookup.insert(name_without_number.to_string(), new_name_index);
+        self.name_lookup
+            .insert(name_without_number.to_string(), new_name_index);
         self.names.push(name_without_number.to_string());
-        FMinimalName{ index: new_name_index as i32, number: name_number }
+        FMinimalName {
+            index: new_name_index as i32,
+            number: name_number,
+        }
     }
-    pub(crate) fn copy_raw_names(&self) -> Vec<String> { self.names.clone() }
+    pub(crate) fn copy_raw_names(&self) -> Vec<String> {
+        self.names.clone()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -550,11 +716,12 @@ pub(crate) struct FObjectImport {
     pub(crate) object_name: FMinimalName,
     pub(crate) is_optional: bool,
 }
-impl FObjectImport
-{
+impl FObjectImport {
     #[instrument(skip_all, name = "FObjectImport")]
-    pub(crate) fn deserialize<S: Read>(s: &mut S, summary: &FLegacyPackageFileSummary) -> Result<Self> {
-
+    pub(crate) fn deserialize<S: Read>(
+        s: &mut S,
+        summary: &FLegacyPackageFileSummary,
+    ) -> Result<Self> {
         let class_package: FMinimalName = s.de()?;
         let class_name: FMinimalName = s.de()?;
         let outer_index: FPackageIndex = s.de()?;
@@ -566,15 +733,28 @@ impl FObjectImport
             let _package_name: FMinimalName = s.de()?;
         }
 
-        let should_serialize_optional = summary.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::OptionalResources as i32;
-        let is_optional: bool = if should_serialize_optional { s.de()? } else { false };
+        let should_serialize_optional = summary
+            .versioning_info
+            .package_file_version
+            .file_version_ue5
+            >= EUnrealEngineObjectUE5Version::OptionalResources as i32;
+        let is_optional: bool = if should_serialize_optional {
+            s.de()?
+        } else {
+            false
+        };
 
-        Ok(FObjectImport{class_package, class_name, outer_index, object_name, is_optional})
+        Ok(FObjectImport {
+            class_package,
+            class_name,
+            outer_index,
+            object_name,
+            is_optional,
+        })
     }
 
     #[instrument(skip_all, name = "FObjectImport")]
     fn serialize<S: Write>(&self, s: &mut S, summary: &FLegacyPackageFileSummary) -> Result<()> {
-
         s.ser(&self.class_package)?;
         s.ser(&self.class_name)?;
         s.ser(&self.outer_index)?;
@@ -586,7 +766,11 @@ impl FObjectImport
             s.ser(&package_name)?;
         }
 
-        let should_serialize_optional = summary.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::OptionalResources as i32;
+        let should_serialize_optional = summary
+            .versioning_info
+            .package_file_version
+            .file_version_ue5
+            >= EUnrealEngineObjectUE5Version::OptionalResources as i32;
         if should_serialize_optional {
             s.ser(&self.is_optional)?;
         }
@@ -619,11 +803,12 @@ pub(crate) struct FObjectExport {
     pub(crate) script_serialization_start_offset: i64,
     pub(crate) script_serialization_end_offset: i64,
 }
-impl FObjectExport
-{
+impl FObjectExport {
     #[instrument(skip_all, name = "FObjectExport")]
-    pub(crate) fn deserialize<S: Read>(s: &mut S, summary: &FLegacyPackageFileSummary) -> Result<Self> {
-
+    pub(crate) fn deserialize<S: Read>(
+        s: &mut S,
+        summary: &FLegacyPackageFileSummary,
+    ) -> Result<Self> {
         let class_index: FPackageIndex = s.de()?;
         let super_index: FPackageIndex = s.de()?;
         let template_index: FPackageIndex = s.de()?;
@@ -640,14 +825,26 @@ impl FObjectExport
         let is_not_for_server: bool = s.de()?;
 
         // Package GUID serialization of exports has been removed in UE5
-        let should_serialize_package_guid = summary.versioning_info.package_file_version.file_version_ue5 < EUnrealEngineObjectUE5Version::RemoveObjectExportPackageGUID as i32;
+        let should_serialize_package_guid = summary
+            .versioning_info
+            .package_file_version
+            .file_version_ue5
+            < EUnrealEngineObjectUE5Version::RemoveObjectExportPackageGUID as i32;
         if should_serialize_package_guid {
             let _package_guid: FGuid = s.de()?;
         }
 
         // Added in UE5. Default to false for old assets
-        let should_serialize_inherited_instance = summary.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::TrackObjectExportIsInherited as i32;
-        let is_inherited_instance: bool = if should_serialize_inherited_instance { s.de()? } else { false };
+        let should_serialize_inherited_instance = summary
+            .versioning_info
+            .package_file_version
+            .file_version_ue5
+            >= EUnrealEngineObjectUE5Version::TrackObjectExportIsInherited as i32;
+        let is_inherited_instance: bool = if should_serialize_inherited_instance {
+            s.de()?
+        } else {
+            false
+        };
 
         // Package flags are only relevant for forced exports, which do not exist as a concept anymore, so this value is always 0
         let _package_flags: u32 = s.de()?;
@@ -656,8 +853,16 @@ impl FObjectExport
         let is_asset: bool = s.de()?;
 
         // Assume public hash to be generated for assets before UE5
-        let should_serialize_generate_public_hash = summary.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::OptionalResources as i32;
-        let generate_public_hash: bool = if should_serialize_generate_public_hash { s.de()? } else { true };
+        let should_serialize_generate_public_hash = summary
+            .versioning_info
+            .package_file_version
+            .file_version_ue5
+            >= EUnrealEngineObjectUE5Version::OptionalResources as i32;
+        let generate_public_hash: bool = if should_serialize_generate_public_hash {
+            s.de()?
+        } else {
+            true
+        };
 
         let first_export_dependency_index: i32 = s.de()?;
         let serialize_before_serialize_dependencies: i32 = s.de()?;
@@ -665,22 +870,50 @@ impl FObjectExport
         let serialize_before_create_dependencies: i32 = s.de()?;
         let create_before_create_dependencies: i32 = s.de()?;
 
-        let should_serialize_script_props = !summary.uses_unversioned_property_serialization() && summary.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::ScriptSerializationOffset as i32;
-        let script_serialization_start_offset: i64 = if should_serialize_script_props { s.de()? } else { 0 };
-        let script_serialization_end_offset: i64 = if should_serialize_script_props { s.de()? } else { 0 };
+        let should_serialize_script_props = !summary.uses_unversioned_property_serialization()
+            && summary
+                .versioning_info
+                .package_file_version
+                .file_version_ue5
+                >= EUnrealEngineObjectUE5Version::ScriptSerializationOffset as i32;
+        let script_serialization_start_offset: i64 = if should_serialize_script_props {
+            s.de()?
+        } else {
+            0
+        };
+        let script_serialization_end_offset: i64 = if should_serialize_script_props {
+            s.de()?
+        } else {
+            0
+        };
 
-        Ok(FObjectExport{
-            class_index, super_index, template_index, outer_index, object_name, object_flags, serial_size, serial_offset,
-            is_not_for_client, is_not_for_server, is_inherited_instance, is_not_always_loaded_for_editor_game,
-            is_asset, generate_public_hash, first_export_dependency_index, serialize_before_serialize_dependencies,
-            create_before_serialize_dependencies, serialize_before_create_dependencies, create_before_create_dependencies,
-            script_serialization_start_offset, script_serialization_end_offset
+        Ok(FObjectExport {
+            class_index,
+            super_index,
+            template_index,
+            outer_index,
+            object_name,
+            object_flags,
+            serial_size,
+            serial_offset,
+            is_not_for_client,
+            is_not_for_server,
+            is_inherited_instance,
+            is_not_always_loaded_for_editor_game,
+            is_asset,
+            generate_public_hash,
+            first_export_dependency_index,
+            serialize_before_serialize_dependencies,
+            create_before_serialize_dependencies,
+            serialize_before_create_dependencies,
+            create_before_create_dependencies,
+            script_serialization_start_offset,
+            script_serialization_end_offset,
         })
     }
 
     #[instrument(skip_all, name = "FObjectExport")]
     fn serialize<S: Write>(&self, s: &mut S, summary: &FLegacyPackageFileSummary) -> Result<()> {
-
         s.ser(&self.class_index)?;
         s.ser(&self.super_index)?;
         s.ser(&self.template_index)?;
@@ -698,14 +931,27 @@ impl FObjectExport
         s.ser(&self.is_not_for_server)?;
 
         // Package GUID serialization of exports has been removed in UE5. Before then, we serialize an empty GUID
-        let should_serialize_package_guid = summary.versioning_info.package_file_version.file_version_ue5 < EUnrealEngineObjectUE5Version::RemoveObjectExportPackageGUID as i32;
+        let should_serialize_package_guid = summary
+            .versioning_info
+            .package_file_version
+            .file_version_ue5
+            < EUnrealEngineObjectUE5Version::RemoveObjectExportPackageGUID as i32;
         if should_serialize_package_guid {
-            let package_guid: FGuid = FGuid{a: 0, b: 0, c: 0, d: 0};
+            let package_guid: FGuid = FGuid {
+                a: 0,
+                b: 0,
+                c: 0,
+                d: 0,
+            };
             s.ser(&package_guid)?;
         }
 
         // Added in UE5. Default to false for old assets
-        let should_serialize_inherited_instance = summary.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::TrackObjectExportIsInherited as i32;
+        let should_serialize_inherited_instance = summary
+            .versioning_info
+            .package_file_version
+            .file_version_ue5
+            >= EUnrealEngineObjectUE5Version::TrackObjectExportIsInherited as i32;
         if should_serialize_inherited_instance {
             s.ser(&self.is_inherited_instance)?;
         }
@@ -718,7 +964,11 @@ impl FObjectExport
         s.ser(&self.is_asset)?;
 
         // Assume public hash to be generated for assets before UE5
-        let should_serialize_generate_public_hash = summary.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::OptionalResources as i32;
+        let should_serialize_generate_public_hash = summary
+            .versioning_info
+            .package_file_version
+            .file_version_ue5
+            >= EUnrealEngineObjectUE5Version::OptionalResources as i32;
         if should_serialize_generate_public_hash {
             s.ser(&self.generate_public_hash)?;
         }
@@ -729,7 +979,12 @@ impl FObjectExport
         s.ser(&self.serialize_before_create_dependencies)?;
         s.ser(&self.create_before_create_dependencies)?;
 
-        let should_serialize_script_props = !summary.uses_unversioned_property_serialization() && summary.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::ScriptSerializationOffset as i32;
+        let should_serialize_script_props = !summary.uses_unversioned_property_serialization()
+            && summary
+                .versioning_info
+                .package_file_version
+                .file_version_ue5
+                >= EUnrealEngineObjectUE5Version::ScriptSerializationOffset as i32;
         if should_serialize_script_props {
             s.ser(&self.script_serialization_start_offset)?;
             s.ser(&self.script_serialization_end_offset)?;
@@ -741,7 +996,7 @@ impl FObjectExport
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct FObjectDataResource {
     pub(crate) flags: u32,
-    pub(crate)  serial_offset: i64,
+    pub(crate) serial_offset: i64,
     pub(crate) duplicate_serial_offset: i64,
     pub(crate) serial_size: i64,
     pub(crate) raw_size: i64,
@@ -758,7 +1013,15 @@ impl Readable for FObjectDataResource {
         let outer_index: FPackageIndex = s.de()?;
         let legacy_bulk_data_flags: u32 = s.de()?;
 
-        Ok(FObjectDataResource{flags, serial_offset, duplicate_serial_offset, serial_size, raw_size, outer_index, legacy_bulk_data_flags})
+        Ok(FObjectDataResource {
+            flags,
+            serial_offset,
+            duplicate_serial_offset,
+            serial_size,
+            raw_size,
+            outer_index,
+            legacy_bulk_data_flags,
+        })
     }
 }
 impl Writeable for FObjectDataResource {
@@ -784,14 +1047,18 @@ pub(crate) struct FLegacyPackageHeader {
     pub(crate) data_resources: Vec<FObjectDataResource>,
 }
 impl FLegacyPackageHeader {
-    pub(crate) fn deserialize<S: Read + Seek>(s: &mut S, package_version_fallback: Option<FPackageFileVersion>) -> Result<FLegacyPackageHeader> {
-
+    pub(crate) fn deserialize<S: Read + Seek>(
+        s: &mut S,
+        package_version_fallback: Option<FPackageFileVersion>,
+    ) -> Result<FLegacyPackageHeader> {
         // Determine the package version first. We need package version to parse the summary and the rest of the header
-        let package_file_version = heuristic_package_version_from_legacy_package(s, package_version_fallback)?;
+        let package_file_version =
+            heuristic_package_version_from_legacy_package(s, package_version_fallback)?;
 
         // Deserialize package summary
         let package_summary_offset: u64 = s.stream_position()?;
-        let package_summary: FLegacyPackageFileSummary = FLegacyPackageFileSummary::deserialize(s, Some(package_file_version))?;
+        let package_summary: FLegacyPackageFileSummary =
+            FLegacyPackageFileSummary::deserialize(s, Some(package_file_version))?;
 
         // Deserialize name map
         let name_map: FPackageNameMap = FPackageNameMap::read(s, &package_summary)?;
@@ -800,7 +1067,8 @@ impl FLegacyPackageHeader {
         let imports_start_offset = package_summary_offset + package_summary.imports.offset as u64;
         s.seek(SeekFrom::Start(imports_start_offset))?;
 
-        let mut imports: Vec<FObjectImport> = Vec::with_capacity(package_summary.imports.count as usize);
+        let mut imports: Vec<FObjectImport> =
+            Vec::with_capacity(package_summary.imports.count as usize);
         for _ in 0..package_summary.imports.count {
             let object_import: FObjectImport = FObjectImport::deserialize(s, &package_summary)?;
             imports.push(object_import);
@@ -810,22 +1078,25 @@ impl FLegacyPackageHeader {
         let exports_start_offset = package_summary_offset + package_summary.exports.offset as u64;
         s.seek(SeekFrom::Start(exports_start_offset))?;
 
-        let mut exports: Vec<FObjectExport> = Vec::with_capacity(package_summary.exports.count as usize);
+        let mut exports: Vec<FObjectExport> =
+            Vec::with_capacity(package_summary.exports.count as usize);
         for _ in 0..package_summary.exports.count {
             let object_export: FObjectExport = FObjectExport::deserialize(s, &package_summary)?;
             exports.push(object_export);
         }
 
         // Deserialize preload dependencies
-        let preload_dependencies_start_offset = package_summary_offset + package_summary.preload_dependencies.offset as u64;
+        let preload_dependencies_start_offset =
+            package_summary_offset + package_summary.preload_dependencies.offset as u64;
         s.seek(SeekFrom::Start(preload_dependencies_start_offset))?;
-        let preload_dependencies: Vec<FPackageIndex> = s.de_ctx(package_summary.preload_dependencies.count as usize)?;
+        let preload_dependencies: Vec<FPackageIndex> =
+            s.de_ctx(package_summary.preload_dependencies.count as usize)?;
 
         // Data resources are absent on packages below UE 5.2
         let mut data_resources: Vec<FObjectDataResource> = Vec::new();
         if package_summary.data_resource_offset > 0 {
-
-            let data_resource_start_offset = package_summary_offset + package_summary.data_resource_offset as u64;
+            let data_resource_start_offset =
+                package_summary_offset + package_summary.data_resource_offset as u64;
             s.seek(SeekFrom::Start(data_resource_start_offset))?;
 
             // Might be worth moving into the enum once UE adds more data resource versions
@@ -837,10 +1108,21 @@ impl FLegacyPackageHeader {
             let data_resource_count: i32 = s.de()?;
             data_resources = s.de_ctx(data_resource_count as usize)?;
         }
-        Ok(FLegacyPackageHeader{summary: package_summary, name_map, imports, exports, preload_dependencies, data_resources})
+        Ok(FLegacyPackageHeader {
+            summary: package_summary,
+            name_map,
+            imports,
+            exports,
+            preload_dependencies,
+            data_resources,
+        })
     }
-    pub(crate) fn serialize<S: Write + Seek>(&self, s: &mut S, desired_header_size: Option<usize>, log: &Log) -> Result<()> {
-
+    pub(crate) fn serialize<S: Write + Seek>(
+        &self,
+        s: &mut S,
+        desired_header_size: Option<usize>,
+        log: &Log,
+    ) -> Result<()> {
         let package_summary_offset: u64 = s.stream_position()?;
         let mut package_summary: FLegacyPackageFileSummary = self.summary.clone();
 
@@ -848,24 +1130,39 @@ impl FLegacyPackageHeader {
         FLegacyPackageFileSummary::serialize(&package_summary, s)?;
 
         // Write name map. It directly follows the package summary
-        FPackageNameMap::write(&self.name_map, s, &mut package_summary, package_summary_offset)?;
+        FPackageNameMap::write(
+            &self.name_map,
+            s,
+            &mut package_summary,
+            package_summary_offset,
+        )?;
 
         // Write soft object paths offset. We do not actually write any soft object paths because they must be serialized inline for cooked assets,
         // because zen header cannot preserve object paths that are not serialized inline
         let soft_object_paths_offset = (s.stream_position()? - package_summary_offset) as i32;
-        package_summary.soft_object_paths = FCountOffsetPair{count: 0, offset: soft_object_paths_offset};
+        package_summary.soft_object_paths = FCountOffsetPair {
+            count: 0,
+            offset: soft_object_paths_offset,
+        };
 
         // Serialize import map
         let imports_start_offset = (s.stream_position()? - package_summary_offset) as i32;
-        package_summary.imports = FCountOffsetPair{count: self.imports.len() as i32, offset: imports_start_offset};
+        package_summary.imports = FCountOffsetPair {
+            count: self.imports.len() as i32,
+            offset: imports_start_offset,
+        };
         for object_import in &self.imports {
             FObjectImport::serialize(object_import, s, &package_summary)?;
         }
 
         // Serialize export map
         let exports_start_offset_from_stream_start = s.stream_position()?;
-        let exports_start_offset = (exports_start_offset_from_stream_start - package_summary_offset) as i32;
-        package_summary.exports = FCountOffsetPair{count: self.exports.len() as i32, offset: exports_start_offset};
+        let exports_start_offset =
+            (exports_start_offset_from_stream_start - package_summary_offset) as i32;
+        package_summary.exports = FCountOffsetPair {
+            count: self.exports.len() as i32,
+            offset: exports_start_offset,
+        };
         for object_export in &self.exports {
             FObjectExport::serialize(object_export, s, &package_summary)?;
         }
@@ -879,7 +1176,8 @@ impl FLegacyPackageHeader {
         }
 
         // Serialize asset registry data. This is just an empty placeholder for cooked assets
-        let asset_registry_data_start_offset = (s.stream_position()? - package_summary_offset) as i32;
+        let asset_registry_data_start_offset =
+            (s.stream_position()? - package_summary_offset) as i32;
         package_summary.asset_registry_data_offset = asset_registry_data_start_offset;
         let asset_object_data_count: i32 = 0;
         s.ser(&asset_object_data_count)?;
@@ -888,8 +1186,12 @@ impl FLegacyPackageHeader {
         package_summary.world_tile_info_data_offset = 0;
 
         // Serialize preload dependencies
-        let preload_dependencies_start_offset = (s.stream_position()? - package_summary_offset) as i32;
-        package_summary.preload_dependencies = FCountOffsetPair{count: self.preload_dependencies.len() as i32, offset: preload_dependencies_start_offset};
+        let preload_dependencies_start_offset =
+            (s.stream_position()? - package_summary_offset) as i32;
+        package_summary.preload_dependencies = FCountOffsetPair {
+            count: self.preload_dependencies.len() as i32,
+            offset: preload_dependencies_start_offset,
+        };
         for preload_dependency in &self.preload_dependencies {
             s.ser(&preload_dependency.clone())?;
         }
@@ -897,8 +1199,8 @@ impl FLegacyPackageHeader {
         // Serialize data resources if they are present. Write -1 if there are no data resources
         package_summary.data_resource_offset = -1;
         if !self.data_resources.is_empty() {
-
-            let data_resources_start_offset = (s.stream_position()? - package_summary_offset) as i32;
+            let data_resources_start_offset =
+                (s.stream_position()? - package_summary_offset) as i32;
             package_summary.data_resource_offset = data_resources_start_offset;
 
             // Might be worth moving into the enum once UE adds more data resource versions
@@ -929,11 +1231,13 @@ impl FLegacyPackageHeader {
         s.seek(SeekFrom::Start(exports_start_offset_from_stream_start))?;
         let mut end_of_last_export_offset: i64 = total_header_size as i64;
         for object_export in &self.exports {
-
             let mut modified_object_export = object_export.clone();
             modified_object_export.serial_offset += total_header_size as i64;
 
-            end_of_last_export_offset = max(end_of_last_export_offset, modified_object_export.serial_offset + modified_object_export.serial_size);
+            end_of_last_export_offset = max(
+                end_of_last_export_offset,
+                modified_object_export.serial_offset + modified_object_export.serial_size,
+            );
             FObjectExport::serialize(&modified_object_export, s, &package_summary)?;
         }
 
@@ -954,8 +1258,13 @@ impl FLegacyPackageHeader {
 }
 
 // Returns package name and package-relative path to the object
-pub(crate) fn get_package_object_full_name(package: &FLegacyPackageHeader, object_index: FPackageIndex, path_separator: char, lowercase_path: bool, package_name_override: Option<&str>) -> (String, String) {
-
+pub(crate) fn get_package_object_full_name(
+    package: &FLegacyPackageHeader,
+    object_index: FPackageIndex,
+    path_separator: char,
+    lowercase_path: bool,
+    package_name_override: Option<&str>,
+) -> (String, String) {
     // From the outermost to the innermost, e.g. SubObject;Asset;PackageName
     let mut package_object_outer_chain: Vec<FPackageIndex> = Vec::with_capacity(4);
     let mut current_object_index = object_index;
@@ -967,7 +1276,6 @@ pub(crate) fn get_package_object_full_name(package: &FLegacyPackageHeader, objec
         if current_object_index.is_import() {
             let current_import_index = current_object_index.to_import_index() as usize;
             current_object_index = package.imports[current_import_index].outer_index;
-
         } else if current_object_index.is_export() {
             let current_export_index = current_object_index.to_export_index() as usize;
             current_object_index = package.exports[current_export_index].outer_index;
@@ -983,32 +1291,43 @@ pub(crate) fn get_package_object_full_name(package: &FLegacyPackageHeader, objec
         let package_import_index = package_object_outer_chain[0].to_import_index() as usize;
 
         // If the innermost package index is an import, it's a package name. Otherwise, this package name is the package name
-        package_name = package.name_map.get(package.imports[package_import_index].object_name).to_string();
+        package_name = package
+            .name_map
+            .get(package.imports[package_import_index].object_name)
+            .to_string();
         start_object_index = 1;
-
     } else {
         // This is an export, package name is this package name, and we should start path building at index 0
         // Use the provided package name override if it is available instead of the actual package name. This is necessary to produce correct global import index for exports on legacy UE4 zen assets
-        package_name = package_name_override.unwrap_or(&package.summary.package_name).to_string();
+        package_name = package_name_override
+            .unwrap_or(&package.summary.package_name)
+            .to_string();
         start_object_index = 0;
     };
 
     // Build full object name now. We append all elements and use / as a path separator
     let mut full_object_name: String = package_name.clone();
     for outer in &package_object_outer_chain[start_object_index..] {
-
         // Append object path separator
         full_object_name.push(path_separator);
 
         // Append the name of the object if it's an import
         if outer.is_import() {
             let import_index = outer.to_import_index() as usize;
-            full_object_name.push_str(&package.name_map.get(package.imports[import_index].object_name));
+            full_object_name.push_str(
+                &package
+                    .name_map
+                    .get(package.imports[import_index].object_name),
+            );
 
             // Append the name of the object if it's an import
         } else if outer.is_export() {
             let export_index = outer.to_export_index() as usize;
-            full_object_name.push_str(&package.name_map.get(package.exports[export_index].object_name));
+            full_object_name.push_str(
+                &package
+                    .name_map
+                    .get(package.exports[export_index].object_name),
+            );
         }
     }
     // Make sure the entire path is lowercase. This is a requirement for GetPublicExportHash
@@ -1019,32 +1338,34 @@ pub(crate) fn get_package_object_full_name(package: &FLegacyPackageHeader, objec
 }
 
 // Attempts to resolve an original package name from a localized package name. Returns None if the provided package name is not a localized package name. Returns source package name and culture name otherwise
-pub(crate) fn convert_localized_package_name_to_source(package_name: &str) -> Option<(String, String)> {
+pub(crate) fn convert_localized_package_name_to_source(
+    package_name: &str,
+) -> Option<(String, String)> {
     // If the first character is not a /, this is not a localized package (or a valid package name, for that matter)
     if !package_name.starts_with('/') {
         return None;
     }
     // Split package name into Mount Point, L10N and the actual package name. We skip the first slash to keep the logic simpler and append it later
     let package_name_splits: Vec<&str> = package_name[1..].splitn(4, '/').collect();
-    
+
     // If we have less than 3 parts, or the second part is not localization sub-folder, this package is not a localized package
     if package_name_splits.len() != 4 || package_name_splits[1] != "L10N" {
-        return None
+        return None;
     }
     // This is a localized package otherwise. Full path to it is part1 + part3
     let mount_point = package_name_splits[0];
     let culture_name = package_name_splits[2].to_string();
     let package_path = package_name_splits[3];
     let source_package_name = format!("/{mount_point}/{package_path}");
-    
+
     Some((source_package_name, culture_name))
 }
 
 #[derive(Default, Clone)]
 pub(crate) struct FSerializedAssetBundle {
-    pub(crate) asset_file_buffer: Vec<u8>, // uasset
-    pub(crate) exports_file_buffer: Vec<u8>, // uexp
-    pub(crate) bulk_data_buffer: Option<Vec<u8>>, // .ubulk
+    pub(crate) asset_file_buffer: Vec<u8>,                 // uasset
+    pub(crate) exports_file_buffer: Vec<u8>,               // uexp
+    pub(crate) bulk_data_buffer: Option<Vec<u8>>,          // .ubulk
     pub(crate) optional_bulk_data_buffer: Option<Vec<u8>>, // .uptnl
     pub(crate) memory_mapped_bulk_data_buffer: Option<Vec<u8>>, // .m.ubulk
 }

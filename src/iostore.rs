@@ -207,7 +207,7 @@ impl IoStoreBackend {
                 }
             })
             .collect();
-    
+
         let mut containers: Vec<Box<dyn IoStoreTrait>> = paths
             .par_iter()
             .map(|path| -> Result<Box<dyn IoStoreTrait>> {
@@ -217,7 +217,7 @@ impl IoStoreBackend {
                 Ok(Box::new(container) as Box<dyn IoStoreTrait>)
             })
             .collect::<Result<Vec<_>>>()?;
-        
+
         // Validate that all containers are of the same version
         let mut previous_container_version: Option<EIoStoreTocVersion> = None;
         let mut previous_container_name: String = String::new();

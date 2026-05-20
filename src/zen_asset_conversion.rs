@@ -2,7 +2,7 @@ use crate::container_header::{EIoContainerHeaderVersion, StoreEntry};
 use crate::iostore_writer::IoStoreWriter;
 use crate::legacy_asset::{
     convert_localized_package_name_to_source, get_package_object_full_name, EPackageFlags,
-    FLegacyPackageFileSummary, FLegacyPackageHeader, FSerializedAssetBundle, FPackageNameMap,
+    FLegacyPackageFileSummary, FLegacyPackageHeader, FPackageNameMap, FSerializedAssetBundle,
 };
 use crate::logging::{emit_log, log, Log};
 use crate::name_map::{EMappedNameType, FNameMap};
@@ -93,11 +93,20 @@ fn find_material_tag_user_data_export(legacy_package: &FLegacyPackageHeader) -> 
     None
 }
 
-fn parse_name_from_fname(data: &[u8], name_map: &FPackageNameMap, offset: &mut usize) -> Option<String> {
+fn parse_name_from_fname(
+    data: &[u8],
+    name_map: &FPackageNameMap,
+    offset: &mut usize,
+) -> Option<String> {
     if data.len() < 4 {
         return None;
     }
-    let index = i32::from_le_bytes([data[*offset], data[*offset + 1], data[*offset + 2], data[*offset + 3]]) as usize;
+    let index = i32::from_le_bytes([
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
+    ]) as usize;
     *offset += 4;
     if index > 0 && (index as usize) < name_map.get_all_names().len() {
         Some(name_map.get_all_names()[index as usize].clone())
@@ -112,7 +121,8 @@ fn parse_material_slot_tags_from_binary(
     is_ue5: bool,
     package_name: &str,
 ) -> Vec<MaterialSlotTagData> {
-    if let Some(scanned) = scan_material_slot_tags_from_export(export_data, name_map, package_name) {
+    if let Some(scanned) = scan_material_slot_tags_from_export(export_data, name_map, package_name)
+    {
         return scanned;
     }
 
@@ -124,11 +134,17 @@ fn parse_material_slot_tags_from_binary(
     let mut scanned_props = 0;
 
     let has_material_slot_tags = all_names.iter().any(|n| n.contains("MaterialSlotTags"));
-    emit_log(&format!("[MaterialTags] {} - Name map has 'MaterialSlotTags': {}", package_name, has_material_slot_tags));
+    emit_log(&format!(
+        "[MaterialTags] {} - Name map has 'MaterialSlotTags': {}",
+        package_name, has_material_slot_tags
+    ));
     if has_material_slot_tags {
         for (i, name) in all_names.iter().enumerate() {
             if name.contains("MaterialSlot") {
-                emit_log(&format!("[MaterialTags] {} - Name map[{}] = '{}'", package_name, i, name));
+                emit_log(&format!(
+                    "[MaterialTags] {} - Name map[{}] = '{}'",
+                    package_name, i, name
+                ));
             }
         }
     }
@@ -149,12 +165,22 @@ fn parse_material_slot_tags_from_binary(
         let prop_name = all_names[name_idx as usize].clone();
 
         if scanned_props < 3 {
-            emit_log(&format!("[MaterialTags] {} - Scanning property[{}]: '{}' at offset {}", package_name, scanned_props, prop_name, offset - 4));
+            emit_log(&format!(
+                "[MaterialTags] {} - Scanning property[{}]: '{}' at offset {}",
+                package_name,
+                scanned_props,
+                prop_name,
+                offset - 4
+            ));
             scanned_props += 1;
         }
 
         if prop_name.contains("MaterialSlot") {
-            emit_log(&format!("[MaterialTags] {} - Found MaterialSlotTags at offset {}", package_name, offset - 4));
+            emit_log(&format!(
+                "[MaterialTags] {} - Found MaterialSlotTags at offset {}",
+                package_name,
+                offset - 4
+            ));
 
             if offset + 4 > data_len {
                 break;
@@ -183,7 +209,10 @@ fn parse_material_slot_tags_from_binary(
                     export_data[offset + 3],
                 ]);
                 offset += 4;
-                emit_log(&format!("[MaterialTags] {} - Type: {}, Struct: {}", package_name, type_idx, struct_idx));
+                emit_log(&format!(
+                    "[MaterialTags] {} - Type: {}, Struct: {}",
+                    package_name, type_idx, struct_idx
+                ));
             }
 
             if offset + 4 > data_len {
@@ -208,7 +237,10 @@ fn parse_material_slot_tags_from_binary(
                 offset += 4;
             }
 
-            emit_log(&format!("[MaterialTags] {} - Array has {} elements", package_name, array_len));
+            emit_log(&format!(
+                "[MaterialTags] {} - Array has {} elements",
+                package_name, array_len
+            ));
 
             for _ in 0..array_len {
                 if offset + 8 > data_len {
@@ -360,7 +392,8 @@ fn scan_material_slot_tags_from_export(
     let all_names = name_map.get_all_names();
     let material_slot_name_idx = all_names
         .iter()
-        .position(|n| n.eq_ignore_ascii_case("MaterialSlotName"))? as i32;
+        .position(|n| n.eq_ignore_ascii_case("MaterialSlotName"))?
+        as i32;
     let name_property_idx = all_names
         .iter()
         .position(|n| n.eq_ignore_ascii_case("NameProperty"))? as i32;
@@ -392,7 +425,8 @@ fn scan_material_slot_tags_from_export(
         let mut slot_name = None;
         for value_offset in value_offsets {
             let candidate_offset = slot_property_offset + value_offset;
-            let Some(candidate_name) = read_name_string_at(export_data, name_map, candidate_offset) else {
+            let Some(candidate_name) = read_name_string_at(export_data, name_map, candidate_offset)
+            else {
                 continue;
             };
             if candidate_name != "None" && !candidate_name.starts_with("MaterialTag.") {
@@ -417,13 +451,19 @@ fn scan_material_slot_tags_from_export(
             }
         }
 
-        entries.push(MaterialSlotTagData { slot_name, tag_names });
+        entries.push(MaterialSlotTagData {
+            slot_name,
+            tag_names,
+        });
     }
 
     if entries.is_empty() {
         None
     } else {
-        let tagged_slots = entries.iter().filter(|entry| !entry.tag_names.is_empty()).count();
+        let tagged_slots = entries
+            .iter()
+            .filter(|entry| !entry.tag_names.is_empty())
+            .count();
         let total_tags: usize = entries.iter().map(|entry| entry.tag_names.len()).sum();
         emit_log(&format!(
             "[MaterialTags] {} - Scanned MaterialSlotTags: {} slot(s), {} tagged slot(s), {} tag(s)",
@@ -442,11 +482,20 @@ fn patch_skeletal_mesh_materials(
     tag_data: &[MaterialSlotTagData],
     package_name: &str,
 ) -> bool {
-    let expected_slot_names: Vec<&str> = tag_data.iter().map(|tag| tag.slot_name.as_str()).collect();
-    let material_array = match find_skeletal_material_array(export_data, name_map, package_name, &expected_slot_names) {
+    let expected_slot_names: Vec<&str> =
+        tag_data.iter().map(|tag| tag.slot_name.as_str()).collect();
+    let material_array = match find_skeletal_material_array(
+        export_data,
+        name_map,
+        package_name,
+        &expected_slot_names,
+    ) {
         Some(result) => result,
         None => {
-            emit_log(&format!("[MaterialTags] {} - Could not find valid FSkeletalMaterial array", package_name));
+            emit_log(&format!(
+                "[MaterialTags] {} - Could not find valid FSkeletalMaterial array",
+                package_name
+            ));
             return false;
         }
     };
@@ -465,7 +514,8 @@ fn patch_skeletal_mesh_materials(
     let mut new_data = Vec::new();
     let mut total_injected_tags = 0usize;
     let mut tagged_materials = 0usize;
-    let materials_end = material_array.offset + material_array.count * LEGACY_SKELETAL_MATERIAL_SIZE;
+    let materials_end =
+        material_array.offset + material_array.count * LEGACY_SKELETAL_MATERIAL_SIZE;
 
     new_data.extend_from_slice(&export_data[..material_array.offset]);
 
@@ -474,13 +524,18 @@ fn patch_skeletal_mesh_materials(
         let entry_end = entry_offset + LEGACY_SKELETAL_MATERIAL_SIZE;
         new_data.extend_from_slice(&export_data[entry_offset..entry_end]);
 
-        let slot_name = read_name_string_at(export_data, name_map, entry_offset + 4)
-            .unwrap_or_default();
+        let slot_name =
+            read_name_string_at(export_data, name_map, entry_offset + 4).unwrap_or_default();
 
         let mut tags_for_slot = Vec::new();
-        for tag_info in tag_data.iter().filter(|t| t.slot_name.eq_ignore_ascii_case(&slot_name)) {
+        for tag_info in tag_data
+            .iter()
+            .filter(|t| t.slot_name.eq_ignore_ascii_case(&slot_name))
+        {
             for tag_name in &tag_info.tag_names {
-                if let Some(tag_name_idx) = name_map.get_all_names().iter().position(|n| n == tag_name) {
+                if let Some(tag_name_idx) =
+                    name_map.get_all_names().iter().position(|n| n == tag_name)
+                {
                     tags_for_slot.push(tag_name_idx as i32);
                 }
             }
@@ -579,7 +634,10 @@ fn validate_material_array(
     let stride = match layout {
         MaterialArrayLayout::Legacy => LEGACY_SKELETAL_MATERIAL_SIZE,
         MaterialArrayLayout::PaddedEmpty => EMPTY_TAG_SKELETAL_MATERIAL_SIZE,
-        MaterialArrayLayout::PaddedTagged => return validate_tagged_material_array(data, materials_offset, count, name_count).is_some(),
+        MaterialArrayLayout::PaddedTagged => {
+            return validate_tagged_material_array(data, materials_offset, count, name_count)
+                .is_some()
+        }
     };
     let count = count as usize;
     if materials_offset + count * stride > data.len() {
@@ -593,7 +651,8 @@ fn validate_material_array(
         }
 
         if layout == MaterialArrayLayout::PaddedEmpty {
-            let Some(tag_count) = read_i32_at(data, entry_offset + LEGACY_SKELETAL_MATERIAL_SIZE) else {
+            let Some(tag_count) = read_i32_at(data, entry_offset + LEGACY_SKELETAL_MATERIAL_SIZE)
+            else {
                 return false;
             };
             if tag_count != 0 {
@@ -614,9 +673,13 @@ fn material_array_score(
     expected_slot_names: &[&str],
 ) -> usize {
     match layout {
-        MaterialArrayLayout::PaddedTagged => {
-            score_tagged_material_array_slots(data, materials_offset, count, name_map, expected_slot_names)
-        }
+        MaterialArrayLayout::PaddedTagged => score_tagged_material_array_slots(
+            data,
+            materials_offset,
+            count,
+            name_map,
+            expected_slot_names,
+        ),
         MaterialArrayLayout::Legacy => score_material_array_slots(
             data,
             materials_offset,
@@ -674,7 +737,9 @@ fn find_first_material_array_by_layout(
         }
 
         let byte_len = if layout == MaterialArrayLayout::PaddedTagged {
-            let Some(byte_len) = validate_tagged_material_array(export_data, materials_offset, count, name_count) else {
+            let Some(byte_len) =
+                validate_tagged_material_array(export_data, materials_offset, count, name_count)
+            else {
                 continue;
             };
             byte_len
@@ -831,7 +896,8 @@ fn find_skeletal_material_array(
         expected_slot_names,
         MaterialArrayLayout::PaddedTagged,
     ) {
-        let has_existing_tags = candidate.byte_len > candidate.count * EMPTY_TAG_SKELETAL_MATERIAL_SIZE;
+        let has_existing_tags =
+            candidate.byte_len > candidate.count * EMPTY_TAG_SKELETAL_MATERIAL_SIZE;
         if has_existing_tags {
             emit_log(&format!(
                 "[MaterialTags] {} - Found prepatched tagged FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)",
@@ -873,7 +939,13 @@ fn find_skeletal_material_array(
 fn patch_material_tags(builder: &mut ZenPackageBuilder) -> bool {
     let package_name = &builder.legacy_package.summary.package_name;
     let name_map = &builder.legacy_package.name_map;
-    let is_ue5 = builder.legacy_package.summary.versioning_info.package_file_version.file_version_ue5 != 0;
+    let is_ue5 = builder
+        .legacy_package
+        .summary
+        .versioning_info
+        .package_file_version
+        .file_version_ue5
+        != 0;
 
     let skeletal_mesh_idx = match find_skeletal_mesh_export(&builder.legacy_package) {
         Some(idx) => idx,
@@ -883,11 +955,15 @@ fn patch_material_tags(builder: &mut ZenPackageBuilder) -> bool {
     };
 
     let mesh_export = &builder.legacy_package.exports[skeletal_mesh_idx];
-    let mesh_offset = mesh_export.serial_offset as usize - builder.legacy_package.summary.total_header_size as usize;
+    let mesh_offset = mesh_export.serial_offset as usize
+        - builder.legacy_package.summary.total_header_size as usize;
     let mesh_size = mesh_export.serial_size as usize;
 
     if mesh_offset + mesh_size > builder.exports_file_buffer.len() {
-        emit_log(&format!("[MaterialTags] {} - SkeletalMesh export out of bounds", package_name));
+        emit_log(&format!(
+            "[MaterialTags] {} - SkeletalMesh export out of bounds",
+            package_name
+        ));
         return false;
     }
 
@@ -895,31 +971,49 @@ fn patch_material_tags(builder: &mut ZenPackageBuilder) -> bool {
 
     if let Some(tag_user_data_idx) = find_material_tag_user_data_export(&builder.legacy_package) {
         let tag_export = &builder.legacy_package.exports[tag_user_data_idx];
-        let tag_offset = tag_export.serial_offset as usize - builder.legacy_package.summary.total_header_size as usize;
+        let tag_offset = tag_export.serial_offset as usize
+            - builder.legacy_package.summary.total_header_size as usize;
         let tag_size = tag_export.serial_size as usize;
 
         if tag_offset + tag_size <= builder.exports_file_buffer.len() {
             let tag_export_data = &builder.exports_file_buffer[tag_offset..tag_offset + tag_size];
-            tag_data = parse_material_slot_tags_from_binary(tag_export_data, name_map, is_ue5, package_name);
+            tag_data = parse_material_slot_tags_from_binary(
+                tag_export_data,
+                name_map,
+                is_ue5,
+                package_name,
+            );
 
             if !tag_data.is_empty() {
                 let total_tags: usize = tag_data.iter().map(|t| t.tag_names.len()).sum();
-                emit_log(&format!("[MaterialTags] {} - Found {} tag(s) across {} slot(s)", package_name, total_tags, tag_data.len()));
+                emit_log(&format!(
+                    "[MaterialTags] {} - Found {} tag(s) across {} slot(s)",
+                    package_name,
+                    total_tags,
+                    tag_data.len()
+                ));
             }
         }
     }
 
     if tag_data.is_empty() {
-        emit_log(&format!("[MaterialTags] {} - Will patch with null containers (no tags found)", package_name));
+        emit_log(&format!(
+            "[MaterialTags] {} - Will patch with null containers (no tags found)",
+            package_name
+        ));
     }
 
-    let mut mesh_export_data_mut = builder.exports_file_buffer[mesh_offset..mesh_offset + mesh_size].to_vec();
+    let mut mesh_export_data_mut =
+        builder.exports_file_buffer[mesh_offset..mesh_offset + mesh_size].to_vec();
 
     if patch_skeletal_mesh_materials(&mut mesh_export_data_mut, name_map, &tag_data, package_name) {
         let size_diff = mesh_export_data_mut.len() as isize - mesh_size as isize;
-        builder.exports_file_buffer.splice(mesh_offset..mesh_offset + mesh_size, mesh_export_data_mut);
+        builder
+            .exports_file_buffer
+            .splice(mesh_offset..mesh_offset + mesh_size, mesh_export_data_mut);
 
-        let mesh_export_serial_offset = builder.legacy_package.exports[skeletal_mesh_idx].serial_offset;
+        let mesh_export_serial_offset =
+            builder.legacy_package.exports[skeletal_mesh_idx].serial_offset;
         builder.legacy_package.exports[skeletal_mesh_idx].serial_size += size_diff as i64;
 
         for exp in builder.legacy_package.exports.iter_mut() {
@@ -928,7 +1022,10 @@ fn patch_material_tags(builder: &mut ZenPackageBuilder) -> bool {
             }
         }
 
-        emit_log(&format!("[MaterialTags] {} - Patched, size change: +{} bytes", package_name, size_diff));
+        emit_log(&format!(
+            "[MaterialTags] {} - Patched, size change: +{} bytes",
+            package_name, size_diff
+        ));
         return true;
     }
 
@@ -1235,7 +1332,8 @@ fn convert_legacy_import_to_object_index(
     if package_name_lower.contains("/materialtagplugin")
         || full_import_name_lower.contains("/materialtagplugin")
     {
-        let replaced_path = if full_import_name_lower.contains("default__materialtagassetuserdata") {
+        let replaced_path = if full_import_name_lower.contains("default__materialtagassetuserdata")
+        {
             "/Script/Engine.Default__AssetUserData"
         } else if full_import_name_lower.contains("materialtagassetuserdata") {
             "/Script/Engine.AssetUserData"
@@ -1243,7 +1341,10 @@ fn convert_legacy_import_to_object_index(
             "/Script/Engine"
         };
 
-        emit_log(&format!("[MaterialTags] Remapped import[{}]: {} -> {}", import_index, full_import_name, replaced_path));
+        emit_log(&format!(
+            "[MaterialTags] Remapped import[{}]: {} -> {}",
+            import_index, full_import_name, replaced_path
+        ));
         return Ok(FPackageObjectIndex::create_script_import(replaced_path));
     }
 

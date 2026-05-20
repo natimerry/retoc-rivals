@@ -1,6 +1,5 @@
 use crate::legacy_asset::FSerializedAssetBundle;
 
-
 use anyhow::{bail, Context, Result};
 use fs_err as fs;
 use std::path::{Path, PathBuf};
@@ -260,10 +259,7 @@ fn read_optional_if_exists(path: &Path) -> Result<Option<Vec<u8>>> {
 fn make_temp_dir() -> Result<PathBuf> {
     let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-    let dir = std::env::temp_dir().join(format!(
-        "retoc-kawaii-{}-{id}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("retoc-kawaii-{}-{id}", std::process::id()));
 
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create temp dir {}", dir.display()))?;
