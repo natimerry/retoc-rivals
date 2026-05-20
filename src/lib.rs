@@ -60,6 +60,11 @@ pub fn open_iostore<P: AsRef<Path>>(path: P, config: Arc<Config>) -> Result<Box<
     iostore::open(path, config)
 }
 
+/// Public function to open an explicit set of IO store containers.
+pub fn open_iostore_paths(paths: &[PathBuf], config: Arc<Config>) -> Result<Box<dyn IoStoreTrait>> {
+    iostore::open_paths(paths, config)
+}
+
 #[derive(Parser, Debug)]
 pub struct ActionManifest {
     #[arg(index = 1)]
@@ -171,6 +176,27 @@ pub struct ActionToLegacy {
     pub debug: bool,
     /// Do not run in parallel. Useful for debugging
     #[arg(long)]
+    pub no_parallel: bool,
+}
+
+#[derive(Debug)]
+pub struct ActionToLegacyBatchItem {
+    pub output: PathBuf,
+    pub filter: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct ActionToLegacyBatch {
+    /// Explicit .utoc files to open once for the whole batch.
+    pub inputs: Vec<PathBuf>,
+    pub items: Vec<ActionToLegacyBatchItem>,
+    pub no_assets: bool,
+    pub no_shaders: bool,
+    pub no_compres_shaders: bool,
+    pub dry_run: bool,
+    pub version: Option<EngineVersion>,
+    pub verbose: bool,
+    pub debug: bool,
     pub no_parallel: bool,
 }
 
@@ -915,13 +941,64 @@ fn action_to_legacy_inner(
     log: &Log,
 ) -> Result<()> {
     let iostore = iostore::open(&args.input, config.clone())?;
+    action_to_legacy_inner_opened(&args, file_writer, &*iostore, log)
+}
+
+fn action_to_legacy_inner_opened(
+    args: &ActionToLegacy,
+    file_writer: &dyn FileWriterTrait,
+    iostore: &dyn IoStoreTrait,
+    log: &Log,
+) -> Result<()> {
     if !args.no_assets {
         eprintln!("ASSET");
-        action_to_legacy_assets(&args, file_writer, &*iostore, log)?;
+        action_to_legacy_assets(args, file_writer, iostore, log)?;
     }
     if !args.no_shaders {
-        action_to_legacy_shaders(&args, file_writer, &*iostore, log)?;
+        action_to_legacy_shaders(args, file_writer, iostore, log)?;
     }
+    Ok(())
+}
+
+pub fn action_to_legacy_batch(args: ActionToLegacyBatch, config: Arc<Config>) -> Result<()> {
+    eprintln!(
+        "Batch to-legacy: opening {} containers for {} outputs",
+        args.inputs.len(),
+        args.items.len()
+    );
+    let log = Log::new(args.verbose, args.debug);
+    let iostore = iostore::open_paths(&args.inputs, config)?;
+
+    for item in args.items {
+        let action = ActionToLegacy {
+            input: PathBuf::new(),
+            output: item.output,
+            filter: item.filter,
+            no_assets: args.no_assets,
+            no_shaders: args.no_shaders,
+            no_compres_shaders: args.no_compres_shaders,
+            dry_run: args.dry_run,
+            version: args.version,
+            verbose: args.verbose,
+            debug: args.debug,
+            no_parallel: args.no_parallel,
+        };
+
+        if action.dry_run {
+            action_to_legacy_inner_opened(&action, &NullFileWriter, &*iostore, &log)?;
+        } else {
+            let output = if action.output.extension() == Some(std::ffi::OsStr::new("pak")) {
+                action.output.with_extension("")
+            } else {
+                action.output.clone()
+            };
+            fs::create_dir_all(&output)?;
+            let file_writer = FSFileWriter::new(&output);
+            let action = ActionToLegacy { output, ..action };
+            action_to_legacy_inner_opened(&action, &file_writer, &*iostore, &log)?;
+        }
+    }
+
     Ok(())
 }
 

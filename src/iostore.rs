@@ -68,6 +68,10 @@ pub fn open<P: AsRef<Path>>(path: P, config: Arc<Config>) -> Result<Box<dyn IoSt
     })
 }
 
+pub fn open_paths(paths: &[PathBuf], config: Arc<Config>) -> Result<Box<dyn IoStoreTrait>> {
+    Ok(Box::new(IoStoreBackend::open_paths(paths, config)?))
+}
+
 /// Return an object that can be sorted by to achieve container priority.
 /// Higher priority should Cmp higher
 fn sort_container_name(full_name: &str) -> (bool, u32, &str) {
@@ -208,6 +212,10 @@ impl IoStoreBackend {
             })
             .collect();
 
+        Self::open_paths(&paths, config)
+    }
+
+    pub fn open_paths(paths: &[PathBuf], config: Arc<Config>) -> Result<Self> {
         let mut containers: Vec<Box<dyn IoStoreTrait>> = paths
             .par_iter()
             .map(|path| -> Result<Box<dyn IoStoreTrait>> {
