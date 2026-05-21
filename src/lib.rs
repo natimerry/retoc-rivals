@@ -876,41 +876,46 @@ impl FileReaderTrait for PakFileReader {
 }
 
 pub fn action_to_legacy(args: ActionToLegacy, config: Arc<Config>) -> Result<()> {
-    eprintln!("=== action_to_legacy config ===");
-    eprintln!("input: {:?}", args.input);
-    eprintln!("output: {:?}", args.output);
-    eprintln!("filter: {:?}", args.filter);
-    eprintln!("no_assets: {}", args.no_assets);
-    eprintln!("no_shaders: {}", args.no_shaders);
-    eprintln!("no_compres_shaders: {}", args.no_compres_shaders);
-    eprintln!("dry_run: {}", args.dry_run);
-    eprintln!("version: {:?}", args.version);
-    eprintln!("verbose: {}", args.verbose);
-    eprintln!("debug: {}", args.debug);
-    eprintln!("no_parallel: {}", args.no_parallel);
-    eprintln!("aes_keys count: {}", config.aes_keys.len());
-    eprintln!(
+    macro_rules! legacy_status {
+        ($($arg:tt)*) => {
+            emit_log(&format!($($arg)*));
+        };
+    }
+    legacy_status!("=== action_to_legacy config ===");
+    legacy_status!("input: {:?}", args.input);
+    legacy_status!("output: {:?}", args.output);
+    legacy_status!("filter: {:?}", args.filter);
+    legacy_status!("no_assets: {}", args.no_assets);
+    legacy_status!("no_shaders: {}", args.no_shaders);
+    legacy_status!("no_compres_shaders: {}", args.no_compres_shaders);
+    legacy_status!("dry_run: {}", args.dry_run);
+    legacy_status!("version: {:?}", args.version);
+    legacy_status!("verbose: {}", args.verbose);
+    legacy_status!("debug: {}", args.debug);
+    legacy_status!("no_parallel: {}", args.no_parallel);
+    legacy_status!("aes_keys count: {}", config.aes_keys.len());
+    legacy_status!(
         "container_header_version_override: {:?}",
         config.container_header_version_override
     );
-    eprintln!("===============================");
+    legacy_status!("===============================");
 
-    eprintln!("Creating log...");
+    legacy_status!("Creating log...");
     let log = Log::new(args.verbose, args.debug);
-    eprintln!("Log created");
+    legacy_status!("Log created");
 
     if args.dry_run {
-        eprintln!("Dry run mode");
+        legacy_status!("Dry run mode");
         action_to_legacy_inner(args, config, &NullFileWriter, &log)?;
     } else if args.output.extension() == Some(std::ffi::OsStr::new("pak")) {
-        eprintln!("Output is .pak — using FSFileWriter instead to avoid rayon deadlock");
+        legacy_status!("Output is .pak - using FSFileWriter instead to avoid rayon deadlock");
         // Strip .pak and use as directory instead to avoid rayon::in_place_scope deadlock
         let dir_output = args.output.with_extension("");
-        eprintln!("Creating output dir: {:?}", dir_output);
+        legacy_status!("Creating output dir: {:?}", dir_output);
         fs::create_dir_all(&dir_output)?;
-        eprintln!("Output dir created");
+        legacy_status!("Output dir created");
         let file_writer = FSFileWriter::new(&dir_output);
-        eprintln!("Calling action_to_legacy_inner...");
+        legacy_status!("Calling action_to_legacy_inner...");
         action_to_legacy_inner(
             ActionToLegacy {
                 output: dir_output.clone(),
@@ -920,19 +925,19 @@ pub fn action_to_legacy(args: ActionToLegacy, config: Arc<Config>) -> Result<()>
             &file_writer,
             &log,
         )?;
-        eprintln!("action_to_legacy_inner complete");
+        legacy_status!("action_to_legacy_inner complete");
     } else {
-        eprintln!("Output is directory — using FSFileWriter");
-        eprintln!("Creating output dir: {:?}", args.output);
+        legacy_status!("Output is directory - using FSFileWriter");
+        legacy_status!("Creating output dir: {:?}", args.output);
         fs::create_dir_all(&args.output)?;
-        eprintln!("Output dir created");
+        legacy_status!("Output dir created");
         let file_writer = FSFileWriter::new(&args.output);
-        eprintln!("Calling action_to_legacy_inner...");
+        legacy_status!("Calling action_to_legacy_inner...");
         action_to_legacy_inner(args, config, &file_writer, &log)?;
-        eprintln!("action_to_legacy_inner complete");
+        legacy_status!("action_to_legacy_inner complete");
     }
 
-    eprintln!("action_to_legacy done");
+    legacy_status!("action_to_legacy done");
     Ok(())
 }
 fn action_to_legacy_inner(
@@ -952,7 +957,7 @@ fn action_to_legacy_inner_opened(
     log: &Log,
 ) -> Result<()> {
     if !args.no_assets {
-        eprintln!("ASSET");
+        emit_log("ASSET");
         action_to_legacy_assets(args, file_writer, iostore, log)?;
     }
     if !args.no_shaders {
@@ -962,11 +967,11 @@ fn action_to_legacy_inner_opened(
 }
 
 pub fn action_to_legacy_batch(args: ActionToLegacyBatch, config: Arc<Config>) -> Result<()> {
-    eprintln!(
+    emit_log(&format!(
         "Batch to-legacy: opening {} containers for {} outputs",
         args.inputs.len(),
         args.items.len()
-    );
+    ));
     let log = Log::new(args.verbose, args.debug);
     let iostore = iostore::open_paths(&args.inputs, config)?;
 
@@ -1028,7 +1033,7 @@ fn action_to_legacy_assets(
     log: &Log,
 ) -> Result<()> {
     let mut packages_to_extract = vec![];
-    eprintln!("Scanning packages...");
+    emit_log("Scanning packages...");
 
     for package_info in iostore.packages() {
         let chunk_id =
@@ -1045,9 +1050,9 @@ fn action_to_legacy_assets(
         packages_to_extract.push((package_info, package_path));
     }
     let count = packages_to_extract.len();
-    eprintln!("Found {count} assets to convert");
+    emit_log(&format!("Found {count} assets to convert"));
     if count == 0 {
-        eprintln!("No assets matched the to-legacy filter");
+        emit_log("No assets matched the to-legacy filter");
         return Ok(());
     }
 
@@ -1096,12 +1101,12 @@ fn action_to_legacy_assets(
             failed_count
         ));
     });
-    eprintln!(
+    emit_log(&format!(
         "Done: extracted {} ({} failed) to {:?}",
         count - failed_count,
         failed_count,
         args.output
-    );
+    ));
     log!(
         log,
         "Extracted {} ({failed_count} failed) legacy assets to {:?}",
