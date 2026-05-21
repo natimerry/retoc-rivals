@@ -51,7 +51,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use strum::{AsRefStr, FromRepr};
-use tracing::instrument;
+use tracing::{info, instrument};
 pub use version::EngineVersion;
 use zen_asset_conversion::ConvertedZenAssetBundle;
 
@@ -686,6 +686,7 @@ pub fn extract_package_exports(utoc: &Path, config: Arc<Config>, output: &Path) 
         if let Err(e) = asset_conversion::build_legacy(
             &package_context,
             package_info.id(),
+            package_info.container(),
             UEPath::new(path),
             &file_writer,
         ) {
@@ -1010,6 +1011,16 @@ fn progress_style() -> indicatif::ProgressStyle {
     .progress_chars("##-")
 }
 
+fn path_matches_filter(path: &str, filter: &str) -> bool {
+    path.trim_matches('/').replace('\\', "/") == filter.trim_matches('/').replace('\\', "/")
+}
+
+fn path_matches_any_filter(path: &str, filters: &[String]) -> bool {
+    filters
+        .iter()
+        .any(|filter| path_matches_filter(path, filter.as_str()))
+}
+
 fn action_to_legacy_assets(
     args: &ActionToLegacy,
     file_writer: &dyn FileWriterTrait,
@@ -1018,6 +1029,7 @@ fn action_to_legacy_assets(
 ) -> Result<()> {
     let mut packages_to_extract = vec![];
     eprintln!("Scanning packages...");
+
     for package_info in iostore.packages() {
         let chunk_id =
             FIoChunkId::from_package_id(package_info.id(), 0, EIoChunkType::ExportBundleData);
@@ -1027,7 +1039,7 @@ fn action_to_legacy_assets(
                 package_info.id()
             )
         })?;
-        if !args.filter.is_empty() && !args.filter.iter().any(|f| package_path.contains(f)) {
+        if !args.filter.is_empty() && !path_matches_any_filter(&package_path, &args.filter) {
             continue;
         }
         packages_to_extract.push((package_info, package_path));
@@ -1054,6 +1066,7 @@ fn action_to_legacy_assets(
         let res = asset_conversion::build_legacy(
             &package_context,
             package_info.id(),
+            package_info.container(),
             UEPath::new(&path),
             file_writer,
         )
@@ -1117,7 +1130,7 @@ fn action_to_legacy_shaders(
             )
         })?;
 
-        if !args.filter.is_empty() && !args.filter.iter().any(|f| shader_library_path.contains(f)) {
+        if !args.filter.is_empty() && !path_matches_any_filter(&shader_library_path, &args.filter) {
             continue;
         }
         verbose!(log, "Extracting Shader Library: {shader_library_path}");
@@ -2352,6 +2365,9 @@ mod chunk_id {
         }
         pub(crate) fn get_chunk_id(&self) -> u64 {
             u64::from_le_bytes(self.id[0..8].try_into().unwrap())
+        }
+        pub(crate) fn get_chunk_index(&self) -> u16 {
+            u16::from_le_bytes(self.id[8..10].try_into().unwrap())
         }
         pub fn get_chunk_type(&self) -> EIoChunkType {
             EIoChunkType::from_repr(self.id[11] & 0b11_1111).unwrap()

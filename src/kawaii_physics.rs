@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use fs_err as fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use typed_path::Utf8UnixPath as UEPath;
 
 #[cfg(windows)]

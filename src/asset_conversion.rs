@@ -18,7 +18,7 @@ use crate::zen::{
     FInternalDependencyArc, FPackageFileVersion, FPackageIndex, FZenPackageHeader,
     FZenPackageVersioningInfo,
 };
-use crate::{EIoChunkType, FGuid, FIoChunkId, FPackageId, FileWriterTrait, UEPath};
+use crate::{EIoChunkType, FGuid, FIoChunkId, FPackageId, FileWriterTrait, UEPath, UEPathBuf};
 use anyhow::{anyhow, bail};
 use key_mutex::KeyMutex;
 use std::cmp::max;
@@ -224,17 +224,252 @@ impl<'a> FZenPackageContext<'a> {
             .insert(package_id, shared_package_header.clone());
         Ok(shared_package_header)
     }
-    fn read_full_package_data(&self, package_id: FPackageId) -> anyhow::Result<Vec<u8>> {
-        // Lookup redirect package ID first before trying the provided package ID
-        let redirected_package_id = self
-            .store_access
+
+    fn load_package_from_store(
+        &self,
+        package_id: FPackageId,
+        store_access: &dyn IoStoreTrait,
+    ) -> anyhow::Result<Arc<FZenPackageHeader>> {
+        if std::ptr::addr_eq(store_access, self.store_access) {
+            return self.lookup(package_id);
+        }
+
+        let redirected_package_id = store_access
+            .lookup_package_redirect(package_id)
+            .unwrap_or(package_id);
+        let package_chunk_id =
+            FIoChunkId::from_package_id(redirected_package_id, 0, EIoChunkType::ExportBundleData);
+        let package_data = store_access.read(package_chunk_id)?;
+        let package_store_entry_ref = store_access
+            .package_store_entry(redirected_package_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Failed to find Package Store Entry for Package Id {} in source container {}",
+                    package_id,
+                    store_access.container_name()
+                )
+            })?;
+
+        let mut zen_package_buffer = Cursor::new(package_data);
+        let container_version = store_access
+            .container_file_version()
+            .or_else(|| self.store_access.container_file_version())
+            .ok_or_else(|| anyhow!("Failed to retrieve container TOC version"))?;
+        let container_header_version = store_access
+            .container_header_version()
+            .or_else(|| self.store_access.container_header_version())
+            .ok_or_else(|| anyhow!("Failed to retrieve container header version"))?;
+
+        Ok(Arc::new(FZenPackageHeader::deserialize(
+            &mut zen_package_buffer,
+            Some(package_store_entry_ref),
+            container_version,
+            container_header_version,
+            self.fallback_package_file_version,
+        )?))
+    }
+
+    fn read_full_package_data_from_store(
+        &self,
+        package_id: FPackageId,
+        store_access: &dyn IoStoreTrait,
+    ) -> anyhow::Result<Vec<u8>> {
+        let redirected_package_id = store_access
             .lookup_package_redirect(package_id)
             .unwrap_or(package_id);
 
         let package_chunk_id =
             FIoChunkId::from_package_id(redirected_package_id, 0, EIoChunkType::ExportBundleData);
-        self.store_access.read(package_chunk_id)
+        store_access.read(package_chunk_id)
     }
+}
+
+fn looks_like_bare_leaf_package_name(name: &str) -> bool {
+    if name.is_empty() || !name.contains('/') {
+        return true;
+    }
+    if name.starts_with("/Game/")
+        || name.starts_with("/Engine/")
+        || name.starts_with("/Script/")
+        || name.starts_with("/Plugins/")
+    {
+        return false;
+    }
+    !name.starts_with('/')
+}
+
+fn normalize_package_name(package_name: &str) -> String {
+    let mut package_name = package_name.replace('\\', "/");
+
+    if package_name.contains("/../") {
+        let mut resolved = Vec::new();
+        for segment in package_name.split('/') {
+            if segment == ".." && !resolved.is_empty() && resolved.last() != Some(&"..") {
+                resolved.pop();
+            } else if segment != "." {
+                resolved.push(segment);
+            }
+        }
+        package_name = resolved.join("/");
+    }
+
+    if package_name.starts_with("/Engine/") {
+        return package_name;
+    }
+
+    if let Some(content_index) = package_name.to_ascii_lowercase().find("/content/") {
+        return format!("/Game{}", &package_name[content_index + "/content".len()..]);
+    }
+
+    package_name
+}
+
+fn chunk_path_to_package_name(path: &str) -> Option<String> {
+    let mut path = path.trim().replace('\\', "/");
+    if path.is_empty() {
+        return None;
+    }
+
+    path = path.trim_start_matches('/').to_string();
+    if let Some(rest) = path.strip_prefix("../../../") {
+        path = rest.to_string();
+    }
+    for ext in [".uasset", ".umap"] {
+        if path.ends_with(ext) {
+            path.truncate(path.len() - ext.len());
+            break;
+        }
+    }
+
+    if let Some(rest) = path.strip_prefix("Marvel/Content/") {
+        return Some(format!("/Game/{rest}"));
+    }
+    if let Some(rest) = path.strip_prefix("Content/") {
+        return Some(format!("/Game/{rest}"));
+    }
+    if let Some(rest) = path.strip_prefix("Engine/Content/") {
+        return Some(format!("/Engine/{rest}"));
+    }
+    if let Some(rest) = path.strip_prefix("Marvel/") {
+        return Some(format!("/Game/Marvel/{rest}"));
+    }
+
+    None
+}
+
+fn package_name_to_asset_path(package_name: &str) -> Option<UEPathBuf> {
+    let package_name = normalize_package_name(package_name);
+    let package_name = package_name
+        .trim_end_matches(".uasset")
+        .trim_end_matches(".umap");
+
+    if let Some(rest) = package_name.strip_prefix("/Game/") {
+        return Some(UEPathBuf::from(format!("Marvel/Content/{rest}.uasset")));
+    }
+    if let Some(rest) = package_name.strip_prefix("/Engine/") {
+        return Some(UEPathBuf::from(format!("Engine/Content/{rest}.uasset")));
+    }
+
+    None
+}
+
+fn normalize_iostore_path(path: &str) -> String {
+    let mut path = path.trim().replace('\\', "/");
+    if let Some(rest) = path.strip_prefix("../../../") {
+        path = rest.to_string();
+    }
+    path.trim_start_matches('/').to_ascii_lowercase()
+}
+
+fn read_bulk_chunks_from_store(
+    store_access: &dyn IoStoreTrait,
+    package_id: FPackageId,
+    chunk_type: EIoChunkType,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut chunks = store_access
+        .chunks_all()
+        .filter(|chunk| {
+            chunk.id().get_chunk_type() == chunk_type && chunk.id().get_package_id() == package_id
+        })
+        .collect::<Vec<_>>();
+
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+
+    chunks.sort_by_key(|chunk| chunk.id().get_chunk_index());
+    tracing::debug!(
+        package_id = %package_id,
+        source_container = store_access.container_name(),
+        chunk_type = ?chunk_type,
+        chunk_count = chunks.len(),
+        "reading legacy bulk chunks from selected source container"
+    );
+
+    if chunks.len() == 1 {
+        return Ok(Some(chunks[0].read()?));
+    }
+
+    let mut result = Vec::new();
+    for chunk in chunks {
+        result.extend_from_slice(&chunk.read()?);
+    }
+    Ok(Some(result))
+}
+
+fn read_chunk_by_path(
+    store_access: &dyn IoStoreTrait,
+    normalized_relative_path: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    for chunk in store_access.chunks_all() {
+        let Some(path) = chunk.path() else {
+            continue;
+        };
+        if normalize_iostore_path(&path) == normalized_relative_path {
+            tracing::debug!(
+                path = normalized_relative_path,
+                source_container = chunk.container().container_name(),
+                "reading legacy path-based bulk chunk"
+            );
+            return Ok(Some(chunk.read()?));
+        }
+    }
+
+    Ok(None)
+}
+
+fn read_bulk_by_package_path(
+    package_context: &FZenPackageContext,
+    source_store_access: &dyn IoStoreTrait,
+    package_id: FPackageId,
+    extension: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let package_chunk_id =
+        FIoChunkId::from_package_id(package_id, 0, EIoChunkType::ExportBundleData);
+    let Some(package_path) = source_store_access.chunk_path(package_chunk_id) else {
+        return Ok(None);
+    };
+
+    let mut relative_path = normalize_iostore_path(&package_path);
+    if extension == ".m.ubulk" {
+        for ext in [".uasset", ".umap"] {
+            if relative_path.ends_with(ext) {
+                relative_path.truncate(relative_path.len() - ext.len());
+                break;
+            }
+        }
+        relative_path.push_str(".m.ubulk");
+    } else {
+        for ext in [".uasset", ".umap"] {
+            if relative_path.ends_with(ext) {
+                relative_path.truncate(relative_path.len() - ext.len());
+                break;
+            }
+        }
+        relative_path.push_str(extension);
+    }
+
+    read_chunk_by_path(package_context.store_access, &relative_path)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -511,6 +746,7 @@ fn resolve_generic_zen_import_import(
 
 struct LegacyAssetBuilder<'a, 'b> {
     package_context: &'a FZenPackageContext<'b>,
+    source_store_access: &'a dyn IoStoreTrait,
     package_id: FPackageId,
     zen_package: Arc<FZenPackageHeader>,
     legacy_package: FLegacyPackageHeader,
@@ -528,11 +764,15 @@ struct LegacyAssetBuilder<'a, 'b> {
 fn create_asset_builder<'a, 'b>(
     package_context: &'a FZenPackageContext<'b>,
     package_id: FPackageId,
+    source_store_access: Option<&'a dyn IoStoreTrait>,
 ) -> anyhow::Result<LegacyAssetBuilder<'a, 'b>> {
-    let zen_package: Arc<FZenPackageHeader> = package_context.lookup(package_id)?;
+    let source_store_access = source_store_access.unwrap_or(package_context.store_access);
+    let zen_package: Arc<FZenPackageHeader> =
+        package_context.load_package_from_store(package_id, source_store_access)?;
     drop(package_context.get_script_objects()?);
     Ok(LegacyAssetBuilder {
         package_context,
+        source_store_access,
         package_id,
         zen_package,
         legacy_package: FLegacyPackageHeader::default(),
@@ -546,11 +786,23 @@ fn create_asset_builder<'a, 'b>(
 fn begin_build_summary(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
     // Populate package summary with basic data
     let mut legacy_package_summary = FLegacyPackageFileSummary::default();
-    legacy_package_summary.package_name = builder
-        .zen_package
-        .name_map
-        .get(builder.zen_package.summary.name)
-        .to_string();
+    let mut package_name = builder.zen_package.source_package_name();
+    if looks_like_bare_leaf_package_name(&package_name) {
+        if let Some(chunk_package_name) = builder
+            .source_store_access
+            .chunk_path(FIoChunkId::from_package_id(
+                builder.package_id,
+                0,
+                EIoChunkType::ExportBundleData,
+            ))
+            .and_then(|path| chunk_path_to_package_name(&path))
+        {
+            if !looks_like_bare_leaf_package_name(&chunk_package_name) {
+                package_name = chunk_package_name;
+            }
+        }
+    }
+    legacy_package_summary.package_name = normalize_package_name(&package_name);
     legacy_package_summary.package_flags = builder.zen_package.summary.package_flags;
     legacy_package_summary.package_guid = FGuid {
         a: 0,
@@ -1533,8 +1785,9 @@ fn finalize_asset(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
 fn build_asset_from_zen<'a, 'b>(
     package_context: &'a FZenPackageContext<'b>,
     package_id: FPackageId,
+    source_store_access: Option<&'a dyn IoStoreTrait>,
 ) -> anyhow::Result<LegacyAssetBuilder<'a, 'b>> {
-    let mut asset_builder = create_asset_builder(package_context, package_id)?;
+    let mut asset_builder = create_asset_builder(package_context, package_id, source_store_access)?;
     begin_build_summary(&mut asset_builder)?;
     copy_package_sections(&mut asset_builder)?;
     build_import_map(&mut asset_builder)?;
@@ -1633,7 +1886,7 @@ fn serialize_asset(builder: &LegacyAssetBuilder) -> anyhow::Result<FSerializedAs
     // Copy the raw export data from the chunk into the exports file
     let raw_exports_data = builder
         .package_context
-        .read_full_package_data(builder.package_id)?;
+        .read_full_package_data_from_store(builder.package_id, builder.source_store_access)?;
     let exports_file_buffer = if builder.needs_to_rebuild_exports_data {
         // If we need to rebuild export data, do it now
         rebuild_asset_export_data_internal(builder, &raw_exports_data)?
@@ -1642,30 +1895,23 @@ fn serialize_asset(builder: &LegacyAssetBuilder) -> anyhow::Result<FSerializedAs
         raw_exports_data[builder.zen_package.summary.header_size as usize..].to_vec()
     };
 
-    let bulk_data_chunk_id =
-        FIoChunkId::from_package_id(builder.package_id, 0, EIoChunkType::BulkData);
-    let optional_bulk_data_chunk_id =
-        FIoChunkId::from_package_id(builder.package_id, 0, EIoChunkType::OptionalBulkData);
-    let memory_mapped_bulk_data_chunk_id =
-        FIoChunkId::from_package_id(builder.package_id, 0, EIoChunkType::MemoryMappedBulkData);
-
-    let store_access: &dyn IoStoreTrait = builder.package_context.store_access;
-    let bulk_data_buffer = if store_access.has_chunk_id(bulk_data_chunk_id) {
-        Some(store_access.read(bulk_data_chunk_id)?)
-    } else {
-        None
-    };
-    let optional_bulk_data_buffer = if store_access.has_chunk_id(optional_bulk_data_chunk_id) {
-        Some(store_access.read(optional_bulk_data_chunk_id)?)
-    } else {
-        None
-    };
-    let memory_mapped_bulk_data_buffer =
-        if store_access.has_chunk_id(memory_mapped_bulk_data_chunk_id) {
-            Some(store_access.read(memory_mapped_bulk_data_chunk_id)?)
-        } else {
-            None
-        };
+    let bulk_data_buffer = read_bulk_chunks_from_store(
+        builder.source_store_access,
+        builder.package_id,
+        EIoChunkType::BulkData,
+    )?;
+    let optional_bulk_data_buffer = read_bulk_by_package_path(
+        builder.package_context,
+        builder.source_store_access,
+        builder.package_id,
+        ".uptnl",
+    )?;
+    let memory_mapped_bulk_data_buffer = read_bulk_by_package_path(
+        builder.package_context,
+        builder.source_store_access,
+        builder.package_id,
+        ".m.ubulk",
+    )?;
 
     Ok(FSerializedAssetBundle {
         asset_file_buffer,
@@ -1731,11 +1977,22 @@ fn write_asset(
 pub(crate) fn build_legacy(
     package_context: &FZenPackageContext,
     package_id: FPackageId,
+    source_store_access: &dyn IoStoreTrait,
     out_path: &UEPath,
     file_writer: &dyn FileWriterTrait,
 ) -> anyhow::Result<()> {
     // Build the asset from zen
-    let asset_builder = build_asset_from_zen(package_context, package_id)?;
+    let asset_builder =
+        build_asset_from_zen(package_context, package_id, Some(source_store_access))?;
+    let package_path =
+        package_name_to_asset_path(&asset_builder.legacy_package.summary.package_name);
+    let out_path = package_path.as_deref().unwrap_or(out_path);
+    tracing::debug!(
+        package_id = %package_id,
+        source_container = source_store_access.container_name(),
+        output_path = %out_path,
+        "building legacy asset from selected IoStore source container"
+    );
     // Write the asset to the file
     write_asset(&asset_builder, out_path, file_writer)?;
     Ok(())

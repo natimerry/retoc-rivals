@@ -7,8 +7,7 @@ const EMBED_RS_NAME: &str = "kawaii_binding_embed.rs";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RETOC_SKIP_KAWAII_BINDING_BUILD");
-    println!("cargo:rerun-if-changed=../UAssetAPI/KawaiiPhysicsBinding");
-    println!("cargo:rerun-if-changed=../UAssetAPI/KawaiiPhysicsLegacyPorter.cs");
+    println!("cargo:rerun-if-env-changed=RETOC_KAWAII_BINDING_SELF_CONTAINED");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR was not set"));
     let embed_rs = out_dir.join(EMBED_RS_NAME);
@@ -23,11 +22,13 @@ fn main() {
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR was not set"));
-
-    let project = manifest_dir
+    let uasset_api_dir = manifest_dir
         .parent()
         .expect("retoc crate must have a parent directory")
-        .join("UAssetAPI")
+        .join("UAssetAPI");
+    emit_rerun_if_changed_for_dotnet_sources(&uasset_api_dir);
+
+    let project = uasset_api_dir
         .join("KawaiiPhysicsBinding")
         .join("KawaiiPhysicsBinding.csproj");
 
@@ -47,6 +48,7 @@ fn main() {
 
     let build_root = out_dir.join("kawaii_physics_binding");
     let publish_dir = build_root.join("publish");
+    let self_contained = env_flag("RETOC_KAWAII_BINDING_SELF_CONTAINED");
 
     std::fs::create_dir_all(&publish_dir)
         .expect("failed to create KawaiiPhysicsBinding publish dir");
@@ -66,7 +68,8 @@ fn main() {
     )
     .expect("failed to write local NuGet.Config");
 
-    let status = Command::new("dotnet")
+    let mut publish = Command::new("dotnet");
+    publish
         .arg("publish")
         .arg(&project)
         .arg("--configfile")
@@ -77,11 +80,10 @@ fn main() {
         .arg("-r")
         .arg(rid)
         .arg("--self-contained")
-        .arg("true")
+        .arg(if self_contained { "true" } else { "false" })
         .arg("-p:PublishAot=false")
         .arg("-p:PublishSingleFile=true")
-        .arg("-p:IncludeNativeLibrariesForSelfExtract=true")
-        .arg("-p:EnableCompressionInSingleFile=true")
+        .arg("-p:PublishTrimmed=false")
         .arg("-p:DebugType=embedded")
         .arg("-p:DebugSymbols=false")
         .arg("-o")
@@ -91,7 +93,15 @@ fn main() {
         .env("DOTNET_NOLOGO", "1")
         .env("APPDATA", build_root.join("appdata"))
         .env("LOCALAPPDATA", build_root.join("localappdata"))
-        .env("USERPROFILE", build_root.join("userprofile"))
+        .env("USERPROFILE", build_root.join("userprofile"));
+
+    if self_contained {
+        publish
+            .arg("-p:IncludeNativeLibrariesForSelfExtract=true")
+            .arg("-p:EnableCompressionInSingleFile=true");
+    }
+
+    let status = publish
         .status()
         .expect("failed to run dotnet publish for KawaiiPhysicsBinding");
 
@@ -131,14 +141,66 @@ fn main() {
     }
 
     println!(
-        "cargo:warning=Built KawaiiPhysicsBinding managed helper at {}",
-        binding_binary.display()
+        "cargo:warning=Built KawaiiPhysicsBinding managed helper at {} ({})",
+        binding_binary.display(),
+        if self_contained {
+            "self-contained"
+        } else {
+            "framework-dependent"
+        }
     );
 
     println!(
         "cargo:warning=Embedded KawaiiPhysicsBinding helper via {}",
         embed_rs.display()
     );
+}
+
+fn emit_rerun_if_changed_for_dotnet_sources(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            panic!(
+                "failed to scan dotnet source directory {}: {err}",
+                dir.display()
+            );
+        }
+    };
+
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|err| panic!("failed to read entry in {}: {err}", dir.display()))
+            .path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if path.is_dir() {
+            if matches!(file_name, "bin" | "obj" | ".git") {
+                continue;
+            }
+            emit_rerun_if_changed_for_dotnet_sources(&path);
+            continue;
+        }
+
+        if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("cs" | "csproj" | "props" | "targets" | "json")
+        ) {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn runtime_identifier(target_os: &str, target_arch: &str) -> Option<&'static str> {

@@ -4,11 +4,13 @@ use std::{
     io::{BufReader, Cursor},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{bail, Context, Result};
 use fs_err as fs;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use tracing::debug;
 
 use crate::{
     chunk_id::FIoChunkIdRaw,
@@ -219,9 +221,9 @@ impl IoStoreBackend {
         let mut containers: Vec<Box<dyn IoStoreTrait>> = paths
             .par_iter()
             .map(|path| -> Result<Box<dyn IoStoreTrait>> {
-                emit_log(&format!("Opening container: {:?}", path));
+                debug!("Opening container: {:?}", path);
                 let container = IoStoreContainer::open(path.clone(), config.clone())?;
-                emit_log(&format!("Opened container: {:?}", path));
+                debug!("Opened container: {:?}", path);
                 Ok(Box::new(container) as Box<dyn IoStoreTrait>)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -323,12 +325,12 @@ impl IoStoreTrait for IoStoreBackend {
         Box::new(self.containers.iter().flat_map(|c| c.chunks_all()))
     }
     fn packages(&self) -> Box<dyn Iterator<Item = PackageInfo> + Send + '_> {
-        Box::new(self.containers.iter().flat_map(|c| c.packages()))
-    }
-    fn packages_all(&self) -> Box<dyn Iterator<Item = PackageInfo> + Send + '_> {
         Box::new(UniqueIterator::new(
             self.containers.iter().flat_map(|c| c.packages()),
         ))
+    }
+    fn packages_all(&self) -> Box<dyn Iterator<Item = PackageInfo> + Send + '_> {
+        Box::new(self.containers.iter().flat_map(|c| c.packages_all()))
     }
     fn child_containers(&self) -> Box<dyn Iterator<Item = &dyn IoStoreTrait> + '_> {
         Box::new(self.containers.iter().map(Box::as_ref))
@@ -359,8 +361,25 @@ pub struct IoStoreContainer {
 impl IoStoreContainer {
     pub fn open<P: AsRef<Path>>(toc_path: P, config: Arc<Config>) -> Result<Self> {
         let path = toc_path.as_ref().to_path_buf();
+        let open_start = Instant::now();
+        let phase_start = Instant::now();
         let toc: Toc = BufReader::new(fs::File::open(&path)?).de_ctx(config.clone())?;
+        debug!(
+            path = %path.display(),
+            elapsed_ms = phase_start.elapsed().as_millis(),
+            chunks = toc.chunks.len(),
+            compression_blocks = toc.compression_blocks.len(),
+            indexed_files = toc.file_map.len(),
+            "Parsed IoStore TOC"
+        );
+
+        let phase_start = Instant::now();
         let cas = FilePool::new(path.with_extension("ucas"), rayon::max_num_threads())?;
+        debug!(
+            path = %path.display(),
+            elapsed_ms = phase_start.elapsed().as_millis(),
+            "Opened IoStore UCAS file pool"
+        );
 
         let mut container = Self {
             name: path
@@ -382,12 +401,37 @@ impl IoStoreContainer {
             .find(|info| info.id().get_chunk_type() == EIoChunkType::ContainerHeader);
         if let Some(header_chunk) = header_chunk {
             let chunk_id = header_chunk.id();
+            let header_index = header_chunk.toc_index() as usize;
+            let header_size = container.toc.chunk_offset_lengths[header_index].get_length();
+            debug!(
+                path = %container.path.display(),
+                ?chunk_id,
+                header_size,
+                "Reading IoStore ContainerHeader chunk"
+            );
+            let phase_start = Instant::now();
             let data = container.read(chunk_id)?;
+            debug!(
+                path = %container.path.display(),
+                ?chunk_id,
+                elapsed_ms = phase_start.elapsed().as_millis(),
+                bytes = data.len(),
+                "Read IoStore ContainerHeader chunk"
+            );
+
+            let phase_start = Instant::now();
             match FIoContainerHeader::deserialize(
                 &mut std::io::Cursor::new(&data),
                 config.container_header_version_override,
             ) {
                 Ok(header) => {
+                    debug!(
+                        path = %container.path.display(),
+                        ?chunk_id,
+                        elapsed_ms = phase_start.elapsed().as_millis(),
+                        packages = header.package_ids().count(),
+                        "Deserialized IoStore ContainerHeader"
+                    );
                     container.container_header = Some(header);
                 }
                 Err(err) => {
@@ -395,6 +439,12 @@ impl IoStoreContainer {
                 }
             }
         }
+
+        debug!(
+            path = %container.path.display(),
+            elapsed_ms = open_start.elapsed().as_millis(),
+            "Finished opening IoStore container"
+        );
 
         Ok(container)
     }
