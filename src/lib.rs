@@ -65,6 +65,54 @@ pub fn open_iostore_paths(paths: &[PathBuf], config: Arc<Config>) -> Result<Box<
     iostore::open_paths(paths, config)
 }
 
+pub fn port_kawaii_physics_directory(
+    input: impl AsRef<Path>,
+    usmap_path: impl AsRef<Path>,
+    force_rebuild: bool,
+) -> Result<usize> {
+    let input = input.as_ref();
+    let usmap_path = usmap_path.as_ref();
+    let binding = kawaii_physics::KawaiiPhysicsBinding::load_beside_exe()
+        .context("failed to load KawaiiPhysics native binding")?;
+    let total_ported = AtomicUsize::new(0);
+
+    for path in collect_directory_files(input)? {
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| !ext.eq_ignore_ascii_case("uasset"))
+            .unwrap_or(true)
+        {
+            continue;
+        }
+
+        tracing::debug!(asset = %path.display(), "porting KawaiiPhysics asset in-place");
+        binding
+            .port_asset(Some(usmap_path), &path, force_rebuild, &total_ported)
+            .with_context(|| format!("failed to port KawaiiPhysics asset {}", path.display()))?;
+    }
+
+    Ok(total_ported.load(Ordering::Relaxed))
+}
+
+fn collect_directory_files(input: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_directory_files_inner(input, &mut files)?;
+    Ok(files)
+}
+
+fn collect_directory_files_inner(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_directory_files_inner(&path, files)?;
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 pub struct ActionManifest {
     #[arg(index = 1)]
@@ -260,7 +308,6 @@ impl ActionToZen {
             debug: false,
             no_parallel: false,
             obfuscate: false,
-            // compression: Some(CompressionMethod::Oodle)
             compression,
             port_kawaii_physics: false,
             kawaii_physics_usmap: None,
