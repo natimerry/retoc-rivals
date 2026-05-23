@@ -3,7 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const BINDING_NAME: &str = "KawaiiPhysicsBinding";
+const BINDING_DIR_NAME: &str = BINDING_NAME;
+const BINDING_ASSEMBLY_NAME: &str = "KawaiiPhysicsBinding.dll";
+const BINDING_RUNTIME_CONFIG_NAME: &str = "KawaiiPhysicsBinding.runtimeconfig.json";
 const EMBED_RS_NAME: &str = "kawaii_binding_embed.rs";
+const STAMP_FILE_NAME: &str = ".retoc-kawaii-binding.stamp";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RETOC_SKIP_KAWAII_BINDING_BUILD");
@@ -81,9 +85,11 @@ fn main() {
         .arg(rid)
         .arg("--self-contained")
         .arg(if self_contained { "true" } else { "false" })
+        .arg("-p:GenerateRuntimeConfigurationFiles=true")
         .arg("-p:PublishAot=false")
-        .arg("-p:PublishSingleFile=true")
+        .arg("-p:PublishSingleFile=false")
         .arg("-p:PublishTrimmed=false")
+        .arg("-p:UseAppHost=false")
         .arg("-p:DebugType=embedded")
         .arg("-p:DebugSymbols=false")
         .arg("-o")
@@ -109,40 +115,60 @@ fn main() {
         panic!("dotnet publish failed for {}", project.display());
     }
 
-    let binding_binary = find_binding_binary(&publish_dir, &target_os).unwrap_or_else(|| {
+    let binding_assembly = publish_dir.join(BINDING_ASSEMBLY_NAME);
+    if !binding_assembly.exists() {
         panic!(
-            "dotnet publish succeeded, but binding binary was not found in {}",
+            "dotnet publish succeeded, but {} was not found in {}",
+            BINDING_ASSEMBLY_NAME,
             publish_dir.display()
         )
-    });
+    }
 
-    write_embed_file(&embed_rs, &binding_binary, &target_os);
+    let runtime_config = publish_dir.join(BINDING_RUNTIME_CONFIG_NAME);
+    if !runtime_config.exists() {
+        panic!(
+            "dotnet publish succeeded, but {} was not found in {}",
+            BINDING_RUNTIME_CONFIG_NAME,
+            publish_dir.display()
+        );
+    }
+
+    let publish_files = collect_publish_files(&publish_dir);
+    if publish_files.is_empty() {
+        panic!(
+            "dotnet publish succeeded, but no publish artifacts were found in {}",
+            publish_dir.display()
+        );
+    }
+    let binding_stamp = binding_stamp(&publish_dir, &publish_files);
+
+    write_embed_file(&embed_rs, &publish_dir, &publish_files, &binding_stamp);
 
     // Local dev convenience:
     // cargo-dist will not package this sidecar automatically, but local `cargo run`
-    // can still use the copied helper beside target/debug or target/release.
+    // can still use the copied binding directory beside target/debug or target/release.
     if let Some(profile_dir) = cargo_profile_dir(&out_dir) {
-        copy_binding_binary(&binding_binary, &profile_dir).unwrap_or_else(|err| {
-            panic!(
-                "failed to copy KawaiiPhysicsBinding to {}: {err}",
+        if let Err(err) = copy_binding_artifacts(&publish_dir, &publish_files, &profile_dir) {
+            println!(
+                "cargo:warning=Failed to copy KawaiiPhysicsBinding artifacts to {}: {err}",
                 profile_dir.display()
-            )
-        });
+            );
+        }
 
         let deps_dir = profile_dir.join("deps");
         if deps_dir.exists() {
-            copy_binding_binary(&binding_binary, &deps_dir).unwrap_or_else(|err| {
-                panic!(
-                    "failed to copy KawaiiPhysicsBinding to {}: {err}",
+            if let Err(err) = copy_binding_artifacts(&publish_dir, &publish_files, &deps_dir) {
+                println!(
+                    "cargo:warning=Failed to copy KawaiiPhysicsBinding artifacts to {}: {err}",
                     deps_dir.display()
-                )
-            });
+                );
+            }
         }
     }
 
     println!(
-        "cargo:warning=Built KawaiiPhysicsBinding managed helper at {} ({})",
-        binding_binary.display(),
+        "cargo:warning=Built KawaiiPhysicsBinding managed DLL at {} ({})",
+        binding_assembly.display(),
         if self_contained {
             "self-contained"
         } else {
@@ -151,7 +177,7 @@ fn main() {
     );
 
     println!(
-        "cargo:warning=Embedded KawaiiPhysicsBinding helper via {}",
+        "cargo:warning=Embedded KawaiiPhysicsBinding managed DLL artifacts via {}",
         embed_rs.display()
     );
 }
@@ -218,18 +244,6 @@ fn runtime_identifier(target_os: &str, target_arch: &str) -> Option<&'static str
     }
 }
 
-fn binding_binary_name(target_os: &str) -> String {
-    match target_os {
-        "windows" => format!("{BINDING_NAME}.exe"),
-        _ => BINDING_NAME.to_string(),
-    }
-}
-
-fn find_binding_binary(publish_dir: &Path, target_os: &str) -> Option<PathBuf> {
-    let binary = publish_dir.join(binding_binary_name(target_os));
-    binary.exists().then_some(binary)
-}
-
 fn cargo_profile_dir(out_dir: &Path) -> Option<PathBuf> {
     // OUT_DIR usually:
     // target/debug/build/<pkg-hash>/out
@@ -239,40 +253,147 @@ fn cargo_profile_dir(out_dir: &Path) -> Option<PathBuf> {
     out_dir.parent()?.parent()?.parent().map(Path::to_path_buf)
 }
 
-fn copy_binding_binary(src: &Path, dest_dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dest_dir)?;
+fn collect_publish_files(publish_dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_publish_files_inner(publish_dir, publish_dir, &mut files);
+    files.sort();
+    files
+}
 
-    let file_name = src
-        .file_name()
-        .expect("binding binary should have a file name");
+fn collect_publish_files_inner(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("failed to scan publish directory {}: {err}", dir.display()));
 
-    let dst = dest_dir.join(file_name);
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|err| panic!("failed to read entry in {}: {err}", dir.display()))
+            .path();
 
-    std::fs::copy(src, &dst)?;
+        if path.is_dir() {
+            collect_publish_files_inner(root, &path, files);
+            continue;
+        }
+
+        if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("pdb" | "xml")
+        ) {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to compute publish-relative path for {}: {err}",
+                    path.display()
+                )
+            })
+            .to_path_buf();
+
+        files.push(relative);
+    }
+}
+
+fn binding_stamp(publish_dir: &Path, publish_files: &[PathBuf]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+
+    for relative in publish_files {
+        update_hash(&mut hash, relative.to_string_lossy().as_bytes());
+        update_hash(&mut hash, &[0]);
+
+        let bytes = std::fs::read(publish_dir.join(relative)).unwrap_or_else(|err| {
+            panic!(
+                "failed to read publish artifact {}: {err}",
+                publish_dir.join(relative).display()
+            )
+        });
+        update_hash(&mut hash, &bytes);
+    }
+
+    format!("{hash:016x}")
+}
+
+fn update_hash(hash: &mut u64, bytes: &[u8]) {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+}
+
+fn copy_binding_artifacts(
+    publish_dir: &Path,
+    publish_files: &[PathBuf],
+    dest_dir: &Path,
+) -> std::io::Result<()> {
+    let dest_root = dest_dir.join(BINDING_DIR_NAME);
+    std::fs::create_dir_all(&dest_root)?;
+
+    for relative in publish_files {
+        let src = publish_dir.join(relative);
+        let dst = dest_root.join(relative);
+
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        std::fs::copy(src, dst)?;
+    }
 
     Ok(())
 }
 
-fn write_embed_file(embed_rs: &Path, binding_binary: &Path, target_os: &str) {
-    let binding_name = binding_binary_name(target_os);
+fn write_embed_file(
+    embed_rs: &Path,
+    publish_dir: &Path,
+    publish_files: &[PathBuf],
+    binding_stamp: &str,
+) {
+    let mut entries = String::new();
 
-    let absolute_binding_path = binding_binary.canonicalize().unwrap_or_else(|err| {
-        panic!(
-            "failed to canonicalize binding binary path {}: {err}",
-            binding_binary.display()
-        )
-    });
+    for relative in publish_files {
+        let absolute_path = publish_dir
+            .join(relative)
+            .canonicalize()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to canonicalize publish artifact {}: {err}",
+                    publish_dir.join(relative).display()
+                )
+            });
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        entries.push_str(&format!(
+            "    ({relative:?}, include_bytes!({path:?})),\n",
+            relative = relative,
+            path = absolute_path.to_string_lossy()
+        ));
+    }
 
     let source = format!(
         r#"
 // This file is generated by build.rs. Do not edit by hand.
 
-pub const KAWAII_BINDING_NAME: &str = {binding_name:?};
+pub const KAWAII_BINDING_DIR_NAME: &str = {binding_dir_name:?};
 
-pub static KAWAII_BINDING_BYTES: &[u8] = include_bytes!({binding_path:?});
+pub const KAWAII_BINDING_ASSEMBLY_NAME: &str = {binding_assembly_name:?};
+
+pub const KAWAII_BINDING_RUNTIME_CONFIG_NAME: &str = {runtime_config_name:?};
+
+pub const KAWAII_BINDING_STAMP_FILE_NAME: &str = {stamp_file_name:?};
+
+pub const KAWAII_BINDING_STAMP: &str = {binding_stamp:?};
+
+pub static KAWAII_BINDING_FILES: &[(&str, &[u8])] = &[
+{entries}];
 "#,
-        binding_name = binding_name,
-        binding_path = absolute_binding_path.to_string_lossy(),
+        binding_dir_name = BINDING_DIR_NAME,
+        binding_assembly_name = BINDING_ASSEMBLY_NAME,
+        runtime_config_name = BINDING_RUNTIME_CONFIG_NAME,
+        stamp_file_name = STAMP_FILE_NAME,
+        binding_stamp = binding_stamp,
+        entries = entries,
     );
 
     std::fs::write(embed_rs, source).unwrap_or_else(|err| {
@@ -287,9 +408,17 @@ fn write_empty_embed_file(embed_rs: &Path) {
     let source = r#"
 // This file is generated by build.rs. Do not edit by hand.
 
-pub const KAWAII_BINDING_NAME: &str = "";
+pub const KAWAII_BINDING_DIR_NAME: &str = "";
 
-pub static KAWAII_BINDING_BYTES: &[u8] = &[];
+pub const KAWAII_BINDING_ASSEMBLY_NAME: &str = "";
+
+pub const KAWAII_BINDING_RUNTIME_CONFIG_NAME: &str = "";
+
+pub const KAWAII_BINDING_STAMP_FILE_NAME: &str = "";
+
+pub const KAWAII_BINDING_STAMP: &str = "";
+
+pub static KAWAII_BINDING_FILES: &[(&str, &[u8])] = &[];
 "#;
 
     std::fs::write(embed_rs, source).unwrap_or_else(|err| {
