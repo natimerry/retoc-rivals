@@ -229,6 +229,8 @@ pub struct ActionToLegacy {
 
 #[derive(Debug)]
 pub struct ActionToLegacyBatchItem {
+    /// Item-specific containers to prefer when package ids collide across inputs.
+    pub inputs: Vec<PathBuf>,
     pub output: PathBuf,
     pub filter: Vec<String>,
 }
@@ -1003,12 +1005,22 @@ fn action_to_legacy_inner_opened(
     iostore: &dyn IoStoreTrait,
     log: &Log,
 ) -> Result<()> {
+    action_to_legacy_inner_opened_filtered(args, file_writer, iostore, log, &HashSet::new())
+}
+
+fn action_to_legacy_inner_opened_filtered(
+    args: &ActionToLegacy,
+    file_writer: &dyn FileWriterTrait,
+    iostore: &dyn IoStoreTrait,
+    log: &Log,
+    container_names: &HashSet<String>,
+) -> Result<()> {
     if !args.no_assets {
         emit_log("ASSET");
-        action_to_legacy_assets(args, file_writer, iostore, log)?;
+        action_to_legacy_assets(args, file_writer, iostore, log, container_names)?;
     }
     if !args.no_shaders {
-        action_to_legacy_shaders(args, file_writer, iostore, log)?;
+        action_to_legacy_shaders(args, file_writer, iostore, log, container_names)?;
     }
     Ok(())
 }
@@ -1023,6 +1035,8 @@ pub fn action_to_legacy_batch(args: ActionToLegacyBatch, config: Arc<Config>) ->
     let iostore = iostore::open_paths(&args.inputs, config)?;
 
     for item in args.items {
+        let container_names = container_names_from_paths(&item.inputs);
+
         let action = ActionToLegacy {
             input: PathBuf::new(),
             output: item.output,
@@ -1038,7 +1052,13 @@ pub fn action_to_legacy_batch(args: ActionToLegacyBatch, config: Arc<Config>) ->
         };
 
         if action.dry_run {
-            action_to_legacy_inner_opened(&action, &NullFileWriter, &*iostore, &log)?;
+            action_to_legacy_inner_opened_filtered(
+                &action,
+                &NullFileWriter,
+                &*iostore,
+                &log,
+                &container_names,
+            )?;
         } else {
             let output = if action.output.extension() == Some(std::ffi::OsStr::new("pak")) {
                 action.output.with_extension("")
@@ -1048,11 +1068,27 @@ pub fn action_to_legacy_batch(args: ActionToLegacyBatch, config: Arc<Config>) ->
             fs::create_dir_all(&output)?;
             let file_writer = FSFileWriter::new(&output);
             let action = ActionToLegacy { output, ..action };
-            action_to_legacy_inner_opened(&action, &file_writer, &*iostore, &log)?;
+            action_to_legacy_inner_opened_filtered(
+                &action,
+                &file_writer,
+                &*iostore,
+                &log,
+                &container_names,
+            )?;
         }
     }
 
     Ok(())
+}
+
+fn container_names_from_paths(paths: &[PathBuf]) -> HashSet<String> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+        })
+        .collect()
 }
 
 fn progress_style() -> indicatif::ProgressStyle {
@@ -1078,19 +1114,33 @@ fn action_to_legacy_assets(
     file_writer: &dyn FileWriterTrait,
     iostore: &dyn IoStoreTrait,
     log: &Log,
+    container_names: &HashSet<String>,
 ) -> Result<()> {
     let mut packages_to_extract = vec![];
     emit_log("Scanning packages...");
 
-    for package_info in iostore.packages() {
+    let package_iter = if container_names.is_empty() {
+        iostore.packages()
+    } else {
+        iostore.packages_all()
+    };
+    for package_info in package_iter {
+        if !container_names.is_empty()
+            && !container_names.contains(package_info.container().container_name())
+        {
+            continue;
+        }
         let chunk_id =
             FIoChunkId::from_package_id(package_info.id(), 0, EIoChunkType::ExportBundleData);
-        let package_path = iostore.chunk_path(chunk_id).with_context(|| {
-            format!(
-                "{:?} has no path name entry. Cannot extract",
-                package_info.id()
-            )
-        })?;
+        let package_path = package_info
+            .container()
+            .chunk_path(chunk_id)
+            .with_context(|| {
+                format!(
+                    "{:?} has no path name entry. Cannot extract",
+                    package_info.id()
+                )
+            })?;
         if !args.filter.is_empty() && !path_matches_any_filter(&package_path, &args.filter) {
             continue;
         }
@@ -1168,13 +1218,23 @@ fn action_to_legacy_shaders(
     file_writer: &dyn FileWriterTrait,
     iostore: &dyn IoStoreTrait,
     log: &Log,
+    container_names: &HashSet<String>,
 ) -> Result<()> {
     let compress_shaders = !args.no_compres_shaders;
     let mut libraries_extracted = 0;
-    for chunk_info in iostore
-        .chunks()
-        .filter(|x| x.id().get_chunk_type() == EIoChunkType::ShaderCodeLibrary)
+    let chunk_iter = if container_names.is_empty() {
+        iostore.chunks()
+    } else {
+        iostore.chunks_all()
+    };
+    for chunk_info in
+        chunk_iter.filter(|x| x.id().get_chunk_type() == EIoChunkType::ShaderCodeLibrary)
     {
+        if !container_names.is_empty()
+            && !container_names.contains(chunk_info.container().container_name())
+        {
+            continue;
+        }
         let shader_library_path = chunk_info.path().with_context(|| {
             format!(
                 "Failed to retrieve pathname for shader library chunk {:?}",
@@ -1195,7 +1255,12 @@ fn action_to_legacy_shaders(
 
         let shader_asset_info_path = get_shader_asset_info_filename_from_library_filename(path)?;
         let (shader_library_buffer, shader_asset_info_buffer) =
-            rebuild_shader_library_from_io_store(iostore, chunk_info.id(), log, compress_shaders)?;
+            rebuild_shader_library_from_io_store(
+                chunk_info.container(),
+                chunk_info.id(),
+                log,
+                compress_shaders,
+            )?;
         file_writer.write_file(path.to_string(), false, shader_library_buffer)?;
         file_writer.write_file(
             shader_asset_info_path,
