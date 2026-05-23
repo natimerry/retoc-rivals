@@ -7,6 +7,7 @@ use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use typed_path::Utf8UnixPath as UEPath;
 
 #[cfg(not(windows))]
@@ -16,6 +17,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::windows::ffi::OsStrExt;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SHARED_BINDING: OnceLock<Result<Arc<KawaiiPhysicsBinding>, String>> = OnceLock::new();
 
 const HOSTFXR_DELEGATE_LOAD_ASSEMBLY_AND_GET_FUNCTION_POINTER: i32 = 5;
 const NATIVE_EXPORT_TYPE_NAME: &str = "KawaiiPhysicsBinding.NativeExports, KawaiiPhysicsBinding";
@@ -74,9 +76,21 @@ pub struct KawaiiPhysicsBinding {
     binding_dir: PathBuf,
     _hostfxr: Hostfxr,
     port_asset: PortAssetFn,
+    call_mutex: Mutex<()>,
 }
 
 impl KawaiiPhysicsBinding {
+    pub fn load_shared_beside_exe() -> Result<Arc<Self>> {
+        match SHARED_BINDING.get_or_init(|| {
+            Self::load_beside_exe()
+                .map(Arc::new)
+                .map_err(|err| format!("{err:#}"))
+        }) {
+            Ok(binding) => Ok(binding.clone()),
+            Err(err) => bail!("{err}"),
+        }
+    }
+
     pub fn load_beside_exe() -> Result<Self> {
         let exe = std::env::current_exe().context("failed to resolve current executable path")?;
 
@@ -110,6 +124,7 @@ impl KawaiiPhysicsBinding {
             binding_dir,
             _hostfxr: hostfxr,
             port_asset,
+            call_mutex: Mutex::new(()),
         })
     }
 
@@ -124,6 +139,10 @@ impl KawaiiPhysicsBinding {
         let uasset_path = path_to_cstring(uasset_path)?;
         let mut result = KawaiiPhysicsPortNativeResult::default();
         let mut error_buffer = vec![0u8; ERROR_BUFFER_LEN];
+        let _call_guard = self
+            .call_mutex
+            .lock()
+            .map_err(|_| anyhow::anyhow!("KawaiiPhysics managed binding mutex was poisoned"))?;
 
         tracing::debug!(
             binding_dir = %self.binding_dir.display(),

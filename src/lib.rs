@@ -72,8 +72,8 @@ pub fn port_kawaii_physics_directory(
 ) -> Result<usize> {
     let input = input.as_ref();
     let usmap_path = usmap_path.as_ref();
-    let binding = kawaii_physics::KawaiiPhysicsBinding::load_beside_exe()
-        .context("failed to load KawaiiPhysics native binding")?;
+    let binding = kawaii_physics::KawaiiPhysicsBinding::load_shared_beside_exe()
+        .context("failed to load KawaiiPhysics managed DLL binding")?;
     let total_ported = AtomicUsize::new(0);
 
     for path in collect_directory_files(input)? {
@@ -1330,14 +1330,14 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
 
         log!(
             &log,
-            "loading KawaiiPhysics native binding beside executable, usmap={}",
+            "loading KawaiiPhysics managed DLL binding beside executable, usmap={}",
             usmap_path.display()
         );
 
-        Some(std::sync::Arc::new(std::sync::Mutex::new(
-            kawaii_physics::KawaiiPhysicsBinding::load_beside_exe()
-                .context("failed to load KawaiiPhysics native binding")?,
-        )))
+        Some(
+            kawaii_physics::KawaiiPhysicsBinding::load_shared_beside_exe()
+                .context("failed to load KawaiiPhysics managed DLL binding")?,
+        )
     } else {
         None
     };
@@ -1364,15 +1364,11 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
 
                     log!(&log, "porting KawaiiPhysics data for {path:?}");
 
-                    let binding = binding.lock().map_err(|_| {
-                        anyhow::anyhow!("KawaiiPhysics native binding mutex was poisoned")
-                    })?;
-
                     bundle = kawaii_physics::port_bundle(
                         bundle,
                         ue_path,
                         Some(usmap_path),
-                        &binding,
+                        binding,
                         kawaii_physics_force_rebuild,
                         &total_ported,
                     )?;
