@@ -65,6 +65,10 @@ pub fn open_iostore_paths(paths: &[PathBuf], config: Arc<Config>) -> Result<Box<
     iostore::open_paths(paths, config)
 }
 
+pub fn kawaii_physics_dependency_message() -> String {
+    kawaii_physics::kawaii_physics_dependency_message()
+}
+
 pub fn port_kawaii_physics_directory(
     input: impl AsRef<Path>,
     usmap_path: impl AsRef<Path>,

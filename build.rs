@@ -12,6 +12,7 @@ const STAMP_FILE_NAME: &str = ".retoc-kawaii-binding.stamp";
 fn main() {
     println!("cargo:rerun-if-env-changed=RETOC_SKIP_KAWAII_BINDING_BUILD");
     println!("cargo:rerun-if-env-changed=RETOC_KAWAII_BINDING_SELF_CONTAINED");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DOTNET_SELF_CONTAINED");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR was not set"));
     let embed_rs = out_dir.join(EMBED_RS_NAME);
@@ -52,8 +53,13 @@ fn main() {
 
     let build_root = out_dir.join("kawaii_physics_binding");
     let publish_dir = build_root.join("publish");
-    let self_contained = env_flag("RETOC_KAWAII_BINDING_SELF_CONTAINED");
+    let self_contained = env_flag("RETOC_KAWAII_BINDING_SELF_CONTAINED")
+        || env::var_os("CARGO_FEATURE_DOTNET_SELF_CONTAINED").is_some();
 
+    if publish_dir.exists() {
+        std::fs::remove_dir_all(&publish_dir)
+            .expect("failed to clean KawaiiPhysicsBinding publish dir");
+    }
     std::fs::create_dir_all(&publish_dir)
         .expect("failed to create KawaiiPhysicsBinding publish dir");
 
@@ -83,13 +89,15 @@ fn main() {
         .arg("Release")
         .arg("-r")
         .arg(rid)
-        .arg("--self-contained")
-        .arg(if self_contained { "true" } else { "false" })
+        .arg(format!(
+            "-p:KawaiiPhysicsBindingSelfContained={}",
+            if self_contained { "true" } else { "false" }
+        ))
         .arg("-p:GenerateRuntimeConfigurationFiles=true")
+        .arg("-p:RollForward=Major")
         .arg("-p:PublishAot=false")
         .arg("-p:PublishSingleFile=false")
         .arg("-p:PublishTrimmed=false")
-        .arg("-p:UseAppHost=false")
         .arg("-p:DebugType=embedded")
         .arg("-p:DebugSymbols=false")
         .arg("-o")
@@ -100,12 +108,6 @@ fn main() {
         .env("APPDATA", build_root.join("appdata"))
         .env("LOCALAPPDATA", build_root.join("localappdata"))
         .env("USERPROFILE", build_root.join("userprofile"));
-
-    if self_contained {
-        publish
-            .arg("-p:IncludeNativeLibrariesForSelfExtract=true")
-            .arg("-p:EnableCompressionInSingleFile=true");
-    }
 
     let status = publish
         .status()
@@ -133,6 +135,15 @@ fn main() {
         );
     }
 
+    let binding_executable_name = binding_executable_name(&target_os);
+    if self_contained && !publish_dir.join(binding_executable_name).exists() {
+        panic!(
+            "dotnet publish succeeded, but {} was not found in {}",
+            binding_executable_name,
+            publish_dir.display()
+        );
+    }
+
     let publish_files = collect_publish_files(&publish_dir);
     if publish_files.is_empty() {
         panic!(
@@ -142,7 +153,14 @@ fn main() {
     }
     let binding_stamp = binding_stamp(&publish_dir, &publish_files);
 
-    write_embed_file(&embed_rs, &publish_dir, &publish_files, &binding_stamp);
+    write_embed_file(
+        &embed_rs,
+        &publish_dir,
+        &publish_files,
+        &binding_stamp,
+        self_contained,
+        binding_executable_name,
+    );
 
     // Local dev convenience:
     // cargo-dist will not package this sidecar automatically, but local `cargo run`
@@ -244,6 +262,14 @@ fn runtime_identifier(target_os: &str, target_arch: &str) -> Option<&'static str
     }
 }
 
+fn binding_executable_name(target_os: &str) -> &'static str {
+    if target_os == "windows" {
+        "KawaiiPhysicsBinding.exe"
+    } else {
+        "KawaiiPhysicsBinding"
+    }
+}
+
 fn cargo_profile_dir(out_dir: &Path) -> Option<PathBuf> {
     // OUT_DIR usually:
     // target/debug/build/<pkg-hash>/out
@@ -329,6 +355,9 @@ fn copy_binding_artifacts(
     dest_dir: &Path,
 ) -> std::io::Result<()> {
     let dest_root = dest_dir.join(BINDING_DIR_NAME);
+    if dest_root.exists() {
+        std::fs::remove_dir_all(&dest_root)?;
+    }
     std::fs::create_dir_all(&dest_root)?;
 
     for relative in publish_files {
@@ -350,6 +379,8 @@ fn write_embed_file(
     publish_dir: &Path,
     publish_files: &[PathBuf],
     binding_stamp: &str,
+    self_contained: bool,
+    binding_executable_name: &str,
 ) {
     let mut entries = String::new();
 
@@ -381,6 +412,10 @@ pub const KAWAII_BINDING_ASSEMBLY_NAME: &str = {binding_assembly_name:?};
 
 pub const KAWAII_BINDING_RUNTIME_CONFIG_NAME: &str = {runtime_config_name:?};
 
+pub const KAWAII_BINDING_EXECUTABLE_NAME: &str = {binding_executable_name:?};
+
+pub const KAWAII_BINDING_SELF_CONTAINED: bool = {self_contained};
+
 pub const KAWAII_BINDING_STAMP_FILE_NAME: &str = {stamp_file_name:?};
 
 pub const KAWAII_BINDING_STAMP: &str = {binding_stamp:?};
@@ -391,6 +426,8 @@ pub static KAWAII_BINDING_FILES: &[(&str, &[u8])] = &[
         binding_dir_name = BINDING_DIR_NAME,
         binding_assembly_name = BINDING_ASSEMBLY_NAME,
         runtime_config_name = BINDING_RUNTIME_CONFIG_NAME,
+        binding_executable_name = binding_executable_name,
+        self_contained = self_contained,
         stamp_file_name = STAMP_FILE_NAME,
         binding_stamp = binding_stamp,
         entries = entries,
@@ -413,6 +450,10 @@ pub const KAWAII_BINDING_DIR_NAME: &str = "";
 pub const KAWAII_BINDING_ASSEMBLY_NAME: &str = "";
 
 pub const KAWAII_BINDING_RUNTIME_CONFIG_NAME: &str = "";
+
+pub const KAWAII_BINDING_EXECUTABLE_NAME: &str = "";
+
+pub const KAWAII_BINDING_SELF_CONTAINED: bool = false;
 
 pub const KAWAII_BINDING_STAMP_FILE_NAME: &str = "";
 

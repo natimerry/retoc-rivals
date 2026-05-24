@@ -5,6 +5,7 @@ use fs_err as fs;
 use libloading::Library;
 use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -12,6 +13,8 @@ use typed_path::Utf8UnixPath as UEPath;
 
 #[cfg(not(windows))]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(not(windows))]
+use std::os::unix::fs::PermissionsExt;
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -74,9 +77,18 @@ struct Hostfxr {
 
 pub struct KawaiiPhysicsBinding {
     binding_dir: PathBuf,
-    _hostfxr: Hostfxr,
-    port_asset: PortAssetFn,
+    backend: KawaiiPhysicsBackend,
     call_mutex: Mutex<()>,
+}
+
+enum KawaiiPhysicsBackend {
+    Hosted {
+        _hostfxr: Hostfxr,
+        port_asset: PortAssetFn,
+    },
+    Process {
+        executable: PathBuf,
+    },
 }
 
 impl KawaiiPhysicsBinding {
@@ -106,24 +118,45 @@ impl KawaiiPhysicsBinding {
 
         let runtime_config = binding_dir.join(KAWAII_BINDING_RUNTIME_CONFIG_NAME);
         let assembly = binding_dir.join(KAWAII_BINDING_ASSEMBLY_NAME);
-        let hostfxr_path = find_hostfxr(&binding_dir).context(
-            "failed to locate hostfxr. Install the .NET 8 runtime or publish with \
-             RETOC_KAWAII_BINDING_SELF_CONTAINED=true",
-        )?;
-        let hostfxr = load_hostfxr(&hostfxr_path)?;
-        let load_assembly = load_assembly_delegate(&hostfxr, &runtime_config)?;
-        let port_asset = load_port_asset_fn(load_assembly, &assembly)?;
+        let backend = if KAWAII_BINDING_SELF_CONTAINED {
+            let executable = binding_dir.join(KAWAII_BINDING_EXECUTABLE_NAME);
+            if !executable.exists() {
+                bail!(
+                    "self-contained KawaiiPhysics helper was not found: {}",
+                    executable.display()
+                );
+            }
 
-        tracing::info!(
-            binding_dir = %binding_dir.display(),
-            hostfxr = %hostfxr_path.display(),
-            "loaded KawaiiPhysics managed DLL binding"
-        );
+            tracing::info!(
+                binding_dir = %binding_dir.display(),
+                helper = %executable.display(),
+                "loaded self-contained KawaiiPhysics helper process"
+            );
+
+            KawaiiPhysicsBackend::Process { executable }
+        } else {
+            let hostfxr_path =
+                find_hostfxr(&binding_dir).with_context(kawaii_physics_dependency_message)?;
+            let hostfxr = load_hostfxr(&hostfxr_path)?;
+            let load_assembly = load_assembly_delegate(&hostfxr, &runtime_config)
+                .with_context(kawaii_physics_dependency_message)?;
+            let port_asset = load_port_asset_fn(load_assembly, &assembly)?;
+
+            tracing::info!(
+                binding_dir = %binding_dir.display(),
+                hostfxr = %hostfxr_path.display(),
+                "loaded KawaiiPhysics managed DLL binding"
+            );
+
+            KawaiiPhysicsBackend::Hosted {
+                _hostfxr: hostfxr,
+                port_asset,
+            }
+        };
 
         Ok(Self {
             binding_dir,
-            _hostfxr: hostfxr,
-            port_asset,
+            backend,
             call_mutex: Mutex::new(()),
         })
     }
@@ -135,6 +168,8 @@ impl KawaiiPhysicsBinding {
         force_rebuild: bool,
         ported_count: &AtomicUsize,
     ) -> Result<i32> {
+        let process_usmap_path = usmap_path.map(Path::to_path_buf);
+        let process_uasset_path = uasset_path.to_path_buf();
         let usmap_path = usmap_path.map(path_to_cstring).transpose()?;
         let uasset_path = path_to_cstring(uasset_path)?;
         let mut result = KawaiiPhysicsPortNativeResult::default();
@@ -149,23 +184,35 @@ impl KawaiiPhysicsBinding {
             "calling KawaiiPhysics managed DLL binding"
         );
 
-        let status = unsafe {
-            (self.port_asset)(
-                usmap_path
-                    .as_ref()
-                    .map(|path| path.as_ptr())
-                    .unwrap_or(ptr::null()) as *const u8,
-                uasset_path.as_ptr() as *const u8,
-                if force_rebuild { 1 } else { 0 },
-                &mut result,
-                error_buffer.as_mut_ptr(),
-                error_buffer.len().min(i32::MAX as usize) as i32,
-            )
-        };
+        match &self.backend {
+            KawaiiPhysicsBackend::Hosted { port_asset, .. } => {
+                let status = unsafe {
+                    port_asset(
+                        usmap_path
+                            .as_ref()
+                            .map(|path| path.as_ptr())
+                            .unwrap_or(ptr::null()) as *const u8,
+                        uasset_path.as_ptr() as *const u8,
+                        if force_rebuild { 1 } else { 0 },
+                        &mut result,
+                        error_buffer.as_mut_ptr(),
+                        error_buffer.len().min(i32::MAX as usize) as i32,
+                    )
+                };
 
-        if status != 0 {
-            let error = nul_terminated_utf8(&error_buffer);
-            bail!("KawaiiPhysics managed DLL binding failed with status {status}: {error}");
+                if status != 0 {
+                    let error = nul_terminated_utf8(&error_buffer);
+                    bail!("KawaiiPhysics managed DLL binding failed with status {status}: {error}");
+                }
+            }
+            KawaiiPhysicsBackend::Process { executable } => {
+                result = run_kawaii_physics_helper_process(
+                    executable,
+                    process_usmap_path.as_deref(),
+                    &process_uasset_path,
+                    force_rebuild,
+                )?;
+            }
         }
 
         let ported = result.ported_anim_nodes.max(0);
@@ -234,6 +281,13 @@ fn extract_binding_files(binding_dir: &Path) -> Result<()> {
         .map(|stamp| stamp != KAWAII_BINDING_STAMP)
         .unwrap_or(true);
 
+    if needs_full_extract && binding_dir.exists() {
+        fs::remove_dir_all(binding_dir)
+            .with_context(|| format!("failed to clean {}", binding_dir.display()))?;
+        fs::create_dir_all(binding_dir)
+            .with_context(|| format!("failed to create {}", binding_dir.display()))?;
+    }
+
     for (relative, bytes) in KAWAII_BINDING_FILES {
         let path = binding_artifact_path(binding_dir, relative)?;
         let should_write = needs_full_extract
@@ -253,6 +307,13 @@ fn extract_binding_files(binding_dir: &Path) -> Result<()> {
         fs::write(&path, bytes).with_context(|| {
             format!("failed to extract KawaiiPhysics binding {}", path.display())
         })?;
+
+        #[cfg(not(windows))]
+        if *relative == KAWAII_BINDING_EXECUTABLE_NAME && KAWAII_BINDING_SELF_CONTAINED {
+            let mut permissions = fs::metadata(&path)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions)?;
+        }
     }
 
     fs::write(&stamp_path, KAWAII_BINDING_STAMP).with_context(|| {
@@ -378,6 +439,73 @@ fn load_port_asset_fn(
     Ok(unsafe { std::mem::transmute::<*mut c_void, PortAssetFn>(delegate) })
 }
 
+fn run_kawaii_physics_helper_process(
+    executable: &Path,
+    usmap_path: Option<&Path>,
+    uasset_path: &Path,
+    force_rebuild: bool,
+) -> Result<KawaiiPhysicsPortNativeResult> {
+    let mut command = Command::new(executable);
+    command.arg("port");
+    if let Some(usmap_path) = usmap_path {
+        command.arg(usmap_path);
+    }
+    command.arg(uasset_path);
+    if force_rebuild {
+        command.arg("--force-rebuild");
+    }
+
+    let output = command.output().with_context(|| {
+        format!(
+            "failed to run KawaiiPhysics helper {}",
+            executable.display()
+        )
+    })?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        bail!(
+            "KawaiiPhysics helper failed with status {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    Ok(parse_helper_result(&stderr).unwrap_or_default())
+}
+
+fn parse_helper_result(output: &str) -> Option<KawaiiPhysicsPortNativeResult> {
+    let mut result = KawaiiPhysicsPortNativeResult::default();
+    let mut saw_any = false;
+
+    for token in output.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        let Ok(value) = value.parse::<i32>() else {
+            continue;
+        };
+
+        match key {
+            "visited" => {
+                result.visited_anim_nodes = value;
+                saw_any = true;
+            }
+            "ported" => {
+                result.ported_anim_nodes = value;
+                saw_any = true;
+            }
+            "skipped_existing" => {
+                result.skipped_existing_chains = value;
+                saw_any = true;
+            }
+            _ => {}
+        }
+    }
+
+    saw_any.then_some(result)
+}
+
 fn unmanaged_callers_only_method() -> *const HostChar {
     usize::MAX as *const HostChar
 }
@@ -393,6 +521,75 @@ fn nul_terminated_utf8(buffer: &[u8]) -> String {
         .position(|byte| *byte == 0)
         .unwrap_or(buffer.len());
     String::from_utf8_lossy(&buffer[..end]).trim().to_string()
+}
+
+pub(crate) fn kawaii_physics_dependency_message() -> String {
+    let mut message = String::from(
+        "KawaiiPhysics porting needs the .NET runtime.\n\
+         Download the latest .NET Runtime from:\n\
+         https://dotnet.microsoft.com/download/dotnet/latest/runtime\n\n",
+    );
+
+    #[cfg(target_os = "windows")]
+    {
+        message.push_str(
+            "Windows: install the x64 .NET Runtime, then run this command again. \
+             If you do not want to install .NET, use the self-contained release artifact.",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        message.push_str(&linux_dotnet_dependency_message());
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
+    {
+        message.push_str(
+            "Install the .NET Runtime for this platform, then run this command again. \
+             If you do not want to install .NET, use the self-contained release artifact.",
+        );
+    }
+
+    message
+}
+
+#[cfg(target_os = "linux")]
+fn linux_dotnet_dependency_message() -> String {
+    let os_release = fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let os_id = os_release_value(&os_release, "ID").unwrap_or_default();
+    let id_like = os_release_value(&os_release, "ID_LIKE").unwrap_or_default();
+    let distro = format!("{os_id} {id_like}").to_ascii_lowercase();
+
+    let distro_hint = if distro.contains("arch") {
+        "Arch: sudo pacman -S dotnet-runtime dotnet-hostfxr"
+    } else if distro.contains("ubuntu") || distro.contains("debian") {
+        "Ubuntu/Debian: sudo apt install dotnet-runtime-8.0"
+    } else if distro.contains("fedora") || distro.contains("rhel") {
+        "Fedora: sudo dnf install dotnet-runtime-8.0"
+    } else {
+        "Linux: install your distro's dotnet runtime and hostfxr packages"
+    };
+
+    format!(
+        "{distro_hint}\n\n\
+         Supported distro package names:\n\
+         Arch: dotnet-runtime, dotnet-hostfxr\n\
+         Ubuntu: dotnet-runtime-8.0\n\
+         Fedora: dotnet-runtime-8.0\n\n\
+         If you do not want to install .NET, use the self-contained release artifact."
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn os_release_value(contents: &str, key: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (line_key, value) = line.split_once('=')?;
+        if line_key != key {
+            return None;
+        }
+        Some(value.trim_matches('"').to_string())
+    })
 }
 
 fn find_hostfxr(binding_dir: &Path) -> Option<PathBuf> {
@@ -467,6 +664,8 @@ fn dotnet_roots() -> Vec<PathBuf> {
     #[cfg(not(windows))]
     {
         roots.push(PathBuf::from("/usr/share/dotnet"));
+        roots.push(PathBuf::from("/usr/lib64/dotnet"));
+        roots.push(PathBuf::from("/usr/lib/dotnet"));
         roots.push(PathBuf::from("/usr/local/share/dotnet"));
     }
 
