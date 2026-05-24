@@ -446,6 +446,12 @@ fn run_kawaii_physics_helper_process(
     force_rebuild: bool,
 ) -> Result<KawaiiPhysicsPortNativeResult> {
     let mut command = Command::new(executable);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
     command.arg("port");
     if let Some(usmap_path) = usmap_path {
         command.arg(usmap_path);
@@ -593,6 +599,10 @@ fn os_release_value(contents: &str, key: &str) -> Option<String> {
 }
 
 fn find_hostfxr(binding_dir: &Path) -> Option<PathBuf> {
+    if runtime_env_flag("RETOC_KAWAII_BINDING_FORCE_MISSING_DOTNET") {
+        return None;
+    }
+
     let local = binding_dir.join(hostfxr_library_name());
     if local.exists() {
         return Some(local);
@@ -614,6 +624,16 @@ fn find_hostfxr(binding_dir: &Path) -> Option<PathBuf> {
     }
 
     None
+}
+
+fn runtime_env_flag(name: &str) -> bool {
+    std::env::var_os(name)
+        .and_then(|value| value.into_string().ok())
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && value != "0" && value != "false" && value != "no"
+        })
+        .unwrap_or(false)
 }
 
 fn newest_hostfxr_in_dotnet_root(root: &Path) -> Option<PathBuf> {
