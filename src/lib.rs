@@ -73,9 +73,14 @@ pub fn port_kawaii_physics_directory(
     input: impl AsRef<Path>,
     usmap_path: impl AsRef<Path>,
     force_rebuild: bool,
+    patch_default_hidden_materials: bool,
+    default_hidden_material_bitmaps: Option<&[u64]>,
 ) -> Result<usize> {
     let input = input.as_ref();
     let usmap_path = usmap_path.as_ref();
+    let default_hidden_material_patch_arg = default_hidden_material_bitmaps
+        .map(format_hidden_material_bitmaps)
+        .or_else(|| patch_default_hidden_materials.then(String::new));
     let binding = kawaii_physics::KawaiiPhysicsBinding::load_shared_beside_exe()
         .context("failed to load KawaiiPhysics managed DLL binding")?;
     let total_ported = AtomicUsize::new(0);
@@ -92,11 +97,26 @@ pub fn port_kawaii_physics_directory(
 
         tracing::debug!(asset = %path.display(), "porting KawaiiPhysics asset in-place");
         binding
-            .port_asset(Some(usmap_path), &path, force_rebuild, &total_ported)
+            .port_asset(
+                Some(usmap_path),
+                &path,
+                force_rebuild,
+                true,
+                default_hidden_material_patch_arg.as_deref(),
+                &total_ported,
+            )
             .with_context(|| format!("failed to port KawaiiPhysics asset {}", path.display()))?;
     }
 
     Ok(total_ported.load(Ordering::Relaxed))
+}
+
+fn format_hidden_material_bitmaps(bitmaps: &[u64]) -> String {
+    bitmaps
+        .iter()
+        .map(|bitmap| format!("0x{bitmap:X}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn collect_directory_files(input: &Path) -> Result<Vec<PathBuf>> {
@@ -291,6 +311,12 @@ pub struct ActionToZen {
     /// Rebuild Chains[0] even if chain data already exists.
     #[arg(long)]
     kawaii_physics_force_rebuild: bool,
+    /// Patch LODInfo.DefaultHiddenMaterials via carrier data.
+    #[arg(long)]
+    patch_default_hidden_materials: bool,
+    /// Per-LOD bitmaps for LODInfo.DefaultHiddenMaterials.
+    #[arg(long)]
+    kawaii_physics_default_hidden_material_bitmaps: Vec<u64>,
 }
 
 impl ActionToZen {
@@ -318,6 +344,8 @@ impl ActionToZen {
             port_kawaii_physics: false,
             kawaii_physics_usmap: None,
             kawaii_physics_force_rebuild: true,
+            patch_default_hidden_materials: false,
+            kawaii_physics_default_hidden_material_bitmaps: Vec::new(),
         }
     }
 
@@ -325,6 +353,19 @@ impl ActionToZen {
         self.port_kawaii_physics = true;
         self.kawaii_physics_usmap = Some(usmap);
         self.kawaii_physics_force_rebuild = true;
+        self
+    }
+
+    pub fn with_default_hidden_material_patch(mut self) -> Self {
+        self.patch_default_hidden_materials = true;
+        self
+    }
+
+    pub fn with_kawaii_physics_default_hidden_material_bitmaps(
+        mut self,
+        bitmaps: Vec<u64>,
+    ) -> Self {
+        self.kawaii_physics_default_hidden_material_bitmaps = bitmaps;
         self
     }
 }
@@ -1389,12 +1430,36 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         .as_ref()
         .or(config.kawaii_physics_usmap.as_ref());
     let kawaii_physics_force_rebuild = true;
+    let default_hidden_material_bitmap_override = if !args
+        .kawaii_physics_default_hidden_material_bitmaps
+        .is_empty()
+    {
+        Some(
+            args.kawaii_physics_default_hidden_material_bitmaps
+                .as_slice(),
+        )
+    } else if let Some(config_bitmaps) = config
+        .kawaii_physics_default_hidden_material_bitmaps
+        .as_deref()
+    {
+        Some(config_bitmaps)
+    } else {
+        None
+    };
+    let patch_default_hidden_materials = args.patch_default_hidden_materials
+        || config.patch_default_hidden_materials
+        || default_hidden_material_bitmap_override.is_some();
 
     let kawaii_physics_usmap = kawaii_physics_usmap.as_deref();
+    let default_hidden_material_patch_arg = default_hidden_material_bitmap_override
+        .map(format_hidden_material_bitmaps)
+        .or_else(|| patch_default_hidden_materials.then(String::new));
 
-    let kawaii_binding = if port_kawaii_physics {
+    let kawaii_binding = if port_kawaii_physics || default_hidden_material_patch_arg.is_some() {
         let Some(usmap_path) = kawaii_physics_usmap else {
-            anyhow::bail!("kawaii physics porting was enabled, but no usmap was provided");
+            anyhow::bail!(
+                "KawaiiPhysics/UAssetAPI patching was enabled, but no usmap was provided"
+            );
         };
 
         log!(
@@ -1431,7 +1496,11 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
                     let usmap_path = kawaii_physics_usmap
                         .expect("kawaii_physics_usmap must exist when kawaii_binding exists");
 
-                    log!(&log, "porting KawaiiPhysics data for {path:?}");
+                    if port_kawaii_physics {
+                        log!(&log, "porting KawaiiPhysics data for {path:?}");
+                    } else {
+                        log!(&log, "patching DefaultHiddenMaterials for {path:?}");
+                    }
 
                     bundle = kawaii_physics::port_bundle(
                         bundle,
@@ -1439,6 +1508,8 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
                         Some(usmap_path),
                         binding,
                         kawaii_physics_force_rebuild,
+                        port_kawaii_physics,
+                        default_hidden_material_patch_arg.as_deref(),
                         &total_ported,
                     )?;
                 }
@@ -1647,6 +1718,8 @@ pub struct Config {
     pub port_kawaii_physics: bool,
     pub kawaii_physics_usmap: Option<PathBuf>,
     pub kawaii_physics_force_rebuild: bool,
+    pub patch_default_hidden_materials: bool,
+    pub kawaii_physics_default_hidden_material_bitmaps: Option<Vec<u64>>,
 }
 
 impl Default for Config {
@@ -1657,6 +1730,8 @@ impl Default for Config {
             port_kawaii_physics: false,
             kawaii_physics_usmap: None,
             kawaii_physics_force_rebuild: true,
+            patch_default_hidden_materials: false,
+            kawaii_physics_default_hidden_material_bitmaps: None,
         }
     }
 }

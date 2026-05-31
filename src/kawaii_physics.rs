@@ -55,6 +55,8 @@ type PortAssetFn = unsafe extern "C" fn(
     *const u8,
     *const u8,
     i32,
+    i32,
+    *const u8,
     *mut KawaiiPhysicsPortNativeResult,
     *mut u8,
     i32,
@@ -66,6 +68,7 @@ struct KawaiiPhysicsPortNativeResult {
     visited_anim_nodes: i32,
     ported_anim_nodes: i32,
     skipped_existing_chains: i32,
+    patched_default_hidden_material_lods: i32,
 }
 
 struct Hostfxr {
@@ -166,12 +169,22 @@ impl KawaiiPhysicsBinding {
         usmap_path: Option<&Path>,
         uasset_path: &Path,
         force_rebuild: bool,
+        port_kawaii_physics: bool,
+        default_hidden_material_bitmaps: Option<&str>,
         ported_count: &AtomicUsize,
     ) -> Result<i32> {
         let process_usmap_path = usmap_path.map(Path::to_path_buf);
         let process_uasset_path = uasset_path.to_path_buf();
+        let process_default_hidden_material_bitmaps =
+            default_hidden_material_bitmaps.map(str::to_owned);
         let usmap_path = usmap_path.map(path_to_cstring).transpose()?;
         let uasset_path = path_to_cstring(uasset_path)?;
+        let default_hidden_material_bitmaps = default_hidden_material_bitmaps
+            .map(|value| {
+                CString::new(value.as_bytes())
+                    .context("default hidden material bitmap list contains an interior NUL")
+            })
+            .transpose()?;
         let mut result = KawaiiPhysicsPortNativeResult::default();
         let mut error_buffer = vec![0u8; ERROR_BUFFER_LEN];
         let _call_guard = self
@@ -194,6 +207,11 @@ impl KawaiiPhysicsBinding {
                             .unwrap_or(ptr::null()) as *const u8,
                         uasset_path.as_ptr() as *const u8,
                         if force_rebuild { 1 } else { 0 },
+                        if port_kawaii_physics { 1 } else { 0 },
+                        default_hidden_material_bitmaps
+                            .as_ref()
+                            .map(|value| value.as_ptr())
+                            .unwrap_or(ptr::null()) as *const u8,
                         &mut result,
                         error_buffer.as_mut_ptr(),
                         error_buffer.len().min(i32::MAX as usize) as i32,
@@ -211,6 +229,8 @@ impl KawaiiPhysicsBinding {
                     process_usmap_path.as_deref(),
                     &process_uasset_path,
                     force_rebuild,
+                    port_kawaii_physics,
+                    process_default_hidden_material_bitmaps.as_deref(),
                 )?;
             }
         }
@@ -222,6 +242,7 @@ impl KawaiiPhysicsBinding {
             visited_anim_nodes = result.visited_anim_nodes,
             ported_anim_nodes = result.ported_anim_nodes,
             skipped_existing_chains = result.skipped_existing_chains,
+            patched_default_hidden_material_lods = result.patched_default_hidden_material_lods,
             "KawaiiPhysics managed binding finished"
         );
 
@@ -444,6 +465,8 @@ fn run_kawaii_physics_helper_process(
     usmap_path: Option<&Path>,
     uasset_path: &Path,
     force_rebuild: bool,
+    port_kawaii_physics: bool,
+    default_hidden_material_bitmaps: Option<&str>,
 ) -> Result<KawaiiPhysicsPortNativeResult> {
     let mut command = Command::new(executable);
     #[cfg(windows)]
@@ -459,6 +482,15 @@ fn run_kawaii_physics_helper_process(
     command.arg(uasset_path);
     if force_rebuild {
         command.arg("--force-rebuild");
+    }
+    if !port_kawaii_physics {
+        command.arg("--no-kawaii-physics");
+    }
+    if let Some(default_hidden_material_bitmaps) = default_hidden_material_bitmaps {
+        command.arg("--patch-default-hidden-mats");
+        if !default_hidden_material_bitmaps.is_empty() {
+            command.arg(default_hidden_material_bitmaps);
+        }
     }
 
     let output = command.output().with_context(|| {
@@ -503,6 +535,10 @@ fn parse_helper_result(output: &str) -> Option<KawaiiPhysicsPortNativeResult> {
             }
             "skipped_existing" => {
                 result.skipped_existing_chains = value;
+                saw_any = true;
+            }
+            "default_hidden_material_lods" => {
+                result.patched_default_hidden_material_lods = value;
                 saw_any = true;
             }
             _ => {}
@@ -729,10 +765,18 @@ pub(crate) fn port_bundle(
     usmap_path: Option<&Path>,
     binding: &KawaiiPhysicsBinding,
     force_rebuild: bool,
+    port_kawaii_physics: bool,
+    default_hidden_material_bitmaps: Option<&str>,
     total_ported: &AtomicUsize,
 ) -> Result<FSerializedAssetBundle> {
-    if !bundle_may_contain_kawaii_physics(&bundle) {
+    if port_kawaii_physics
+        && default_hidden_material_bitmaps.is_none()
+        && !bundle_may_contain_kawaii_physics(&bundle)
+    {
         tracing::trace!(asset = %path, "skipping KawaiiPhysics binding for unrelated asset");
+        return Ok(bundle);
+    }
+    if !port_kawaii_physics && default_hidden_material_bitmaps.is_none() {
         return Ok(bundle);
     }
 
@@ -769,7 +813,14 @@ pub(crate) fn port_bundle(
         .with_context(|| format!("failed to write temp m.ubulk {}", mubulk_path.display()))?;
 
         let _ = binding
-            .port_asset(usmap_path, &uasset_path, force_rebuild, total_ported)
+            .port_asset(
+                usmap_path,
+                &uasset_path,
+                force_rebuild,
+                port_kawaii_physics,
+                default_hidden_material_bitmaps,
+                total_ported,
+            )
             .with_context(|| format!("failed to port KawaiiPhysics asset {path}"))?;
 
         bundle.asset_file_buffer = fs::read(&uasset_path)
