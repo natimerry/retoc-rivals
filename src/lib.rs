@@ -75,12 +75,36 @@ pub fn port_kawaii_physics_directory(
     force_rebuild: bool,
     patch_default_hidden_materials: bool,
     default_hidden_material_bitmaps: Option<&[u64]>,
+    edit_options_json: Option<&str>,
+) -> Result<usize> {
+    patch_uasset_directory(
+        input,
+        usmap_path,
+        force_rebuild,
+        true,
+        patch_default_hidden_materials,
+        default_hidden_material_bitmaps,
+        edit_options_json,
+    )
+}
+
+pub fn patch_uasset_directory(
+    input: impl AsRef<Path>,
+    usmap_path: impl AsRef<Path>,
+    force_rebuild: bool,
+    port_kawaii_physics: bool,
+    patch_default_hidden_materials: bool,
+    default_hidden_material_bitmaps: Option<&[u64]>,
+    edit_options_json: Option<&str>,
 ) -> Result<usize> {
     let input = input.as_ref();
     let usmap_path = usmap_path.as_ref();
     let default_hidden_material_patch_arg = default_hidden_material_bitmaps
         .map(format_hidden_material_bitmaps)
         .or_else(|| patch_default_hidden_materials.then(String::new));
+    if !port_kawaii_physics && default_hidden_material_patch_arg.is_none() {
+        return Ok(0);
+    }
     let binding = kawaii_physics::KawaiiPhysicsBinding::load_shared_beside_exe()
         .context("failed to load KawaiiPhysics managed DLL binding")?;
     let total_ported = AtomicUsize::new(0);
@@ -101,8 +125,9 @@ pub fn port_kawaii_physics_directory(
                 Some(usmap_path),
                 &path,
                 force_rebuild,
-                true,
+                port_kawaii_physics,
                 default_hidden_material_patch_arg.as_deref(),
+                edit_options_json,
                 &total_ported,
             )
             .with_context(|| format!("failed to port KawaiiPhysics asset {}", path.display()))?;
@@ -1510,6 +1535,7 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
                         kawaii_physics_force_rebuild,
                         port_kawaii_physics,
                         default_hidden_material_patch_arg.as_deref(),
+                        None,
                         &total_ported,
                     )?;
                 }

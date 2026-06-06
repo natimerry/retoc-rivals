@@ -1331,11 +1331,14 @@ fn convert_legacy_import_to_object_index(
     let full_import_name_lower = full_import_name.to_ascii_lowercase();
     if package_name_lower.contains("/materialtagplugin")
         || full_import_name_lower.contains("/materialtagplugin")
+        || package_name_lower.contains("/rivalsmeshmaterialmanager")
+        || full_import_name_lower.contains("/rivalsmeshmaterialmanager")
     {
-        let replaced_path = if full_import_name_lower.contains("default__materialtagassetuserdata")
-        {
+        let replaced_path = if full_import_name_lower.contains("default__") {
             "/Script/Engine.Default__AssetUserData"
-        } else if full_import_name_lower.contains("materialtagassetuserdata") {
+        } else if full_import_name_lower.contains("materialtagassetuserdata")
+            || full_import_name_lower.contains("hiddenmaterialsassetuserdata")
+        {
             "/Script/Engine.AssetUserData"
         } else {
             "/Script/Engine"

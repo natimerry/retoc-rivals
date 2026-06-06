@@ -57,6 +57,7 @@ type PortAssetFn = unsafe extern "C" fn(
     i32,
     i32,
     *const u8,
+    *const u8,
     *mut KawaiiPhysicsPortNativeResult,
     *mut u8,
     i32,
@@ -171,18 +172,26 @@ impl KawaiiPhysicsBinding {
         force_rebuild: bool,
         port_kawaii_physics: bool,
         default_hidden_material_bitmaps: Option<&str>,
+        edit_options_json: Option<&str>,
         ported_count: &AtomicUsize,
     ) -> Result<i32> {
         let process_usmap_path = usmap_path.map(Path::to_path_buf);
         let process_uasset_path = uasset_path.to_path_buf();
         let process_default_hidden_material_bitmaps =
             default_hidden_material_bitmaps.map(str::to_owned);
+        let process_edit_options_json = edit_options_json.map(str::to_owned);
         let usmap_path = usmap_path.map(path_to_cstring).transpose()?;
         let uasset_path = path_to_cstring(uasset_path)?;
         let default_hidden_material_bitmaps = default_hidden_material_bitmaps
             .map(|value| {
                 CString::new(value.as_bytes())
                     .context("default hidden material bitmap list contains an interior NUL")
+            })
+            .transpose()?;
+        let edit_options_json = edit_options_json
+            .map(|value| {
+                CString::new(value.as_bytes())
+                    .context("KawaiiPhysics edit options JSON contains an interior NUL")
             })
             .transpose()?;
         let mut result = KawaiiPhysicsPortNativeResult::default();
@@ -212,6 +221,10 @@ impl KawaiiPhysicsBinding {
                             .as_ref()
                             .map(|value| value.as_ptr())
                             .unwrap_or(ptr::null()) as *const u8,
+                        edit_options_json
+                            .as_ref()
+                            .map(|value| value.as_ptr())
+                            .unwrap_or(ptr::null()) as *const u8,
                         &mut result,
                         error_buffer.as_mut_ptr(),
                         error_buffer.len().min(i32::MAX as usize) as i32,
@@ -231,6 +244,7 @@ impl KawaiiPhysicsBinding {
                     force_rebuild,
                     port_kawaii_physics,
                     process_default_hidden_material_bitmaps.as_deref(),
+                    process_edit_options_json.as_deref(),
                 )?;
             }
         }
@@ -467,6 +481,7 @@ fn run_kawaii_physics_helper_process(
     force_rebuild: bool,
     port_kawaii_physics: bool,
     default_hidden_material_bitmaps: Option<&str>,
+    edit_options_json: Option<&str>,
 ) -> Result<KawaiiPhysicsPortNativeResult> {
     let mut command = Command::new(executable);
     #[cfg(windows)]
@@ -491,6 +506,9 @@ fn run_kawaii_physics_helper_process(
         if !default_hidden_material_bitmaps.is_empty() {
             command.arg(default_hidden_material_bitmaps);
         }
+    }
+    if let Some(edit_options_json) = edit_options_json {
+        command.arg("--options-json").arg(edit_options_json);
     }
 
     let output = command.output().with_context(|| {
@@ -767,6 +785,7 @@ pub(crate) fn port_bundle(
     force_rebuild: bool,
     port_kawaii_physics: bool,
     default_hidden_material_bitmaps: Option<&str>,
+    edit_options_json: Option<&str>,
     total_ported: &AtomicUsize,
 ) -> Result<FSerializedAssetBundle> {
     if port_kawaii_physics
@@ -819,6 +838,7 @@ pub(crate) fn port_bundle(
                 force_rebuild,
                 port_kawaii_physics,
                 default_hidden_material_bitmaps,
+                edit_options_json,
                 total_ported,
             )
             .with_context(|| format!("failed to port KawaiiPhysics asset {path}"))?;
