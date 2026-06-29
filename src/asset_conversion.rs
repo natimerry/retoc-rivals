@@ -1,10 +1,10 @@
 use crate::container_header::EIoContainerHeaderVersion;
 use crate::iostore::IoStoreTrait;
 use crate::legacy_asset::{
-    FLegacyPackageFileSummary, FLegacyPackageHeader, FLegacyPackageVersioningInfo,
-    FObjectDataResource, FObjectExport, FObjectImport, FPackageNameMap, FSerializedAssetBundle,
-    CLASS_CLASS_NAME, CORE_OBJECT_PACKAGE_NAME, OBJECT_CLASS_NAME, PACKAGE_CLASS_NAME,
-    PRESTREAM_PACKAGE_CLASS_NAME,
+    get_public_export_hash, FLegacyPackageFileSummary, FLegacyPackageHeader,
+    FLegacyPackageVersioningInfo, FObjectDataResource, FObjectExport, FObjectImport,
+    FPackageNameMap, FSerializedAssetBundle, CLASS_CLASS_NAME, CORE_OBJECT_PACKAGE_NAME,
+    OBJECT_CLASS_NAME, PACKAGE_CLASS_NAME, PRESTREAM_PACKAGE_CLASS_NAME,
 };
 use crate::logging::Log;
 use crate::logging::*;
@@ -472,6 +472,22 @@ fn read_bulk_by_package_path(
     read_chunk_by_path(package_context.store_access, &relative_path)
 }
 
+fn read_bulk_by_package_id_with_path_fallback(
+    package_context: &FZenPackageContext,
+    source_store_access: &dyn IoStoreTrait,
+    package_id: FPackageId,
+    chunk_type: EIoChunkType,
+    extension: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if let Some(data) =
+        read_bulk_chunks_from_store(package_context.store_access, package_id, chunk_type)?
+    {
+        return Ok(Some(data));
+    }
+
+    read_bulk_by_package_path(package_context, source_store_access, package_id, extension)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 struct ResolvedZenImport {
     class_package: String,
@@ -565,6 +581,32 @@ fn resolve_package_import(
         resolve_package_import_internal_legacy(package_cache, package_header, import)
     }
 }
+
+fn infer_top_level_package_import(
+    package_name: &str,
+    public_export_hash: u64,
+) -> Option<ResolvedZenImport> {
+    let object_name = package_name.rsplit('/').next()?;
+    if object_name.is_empty()
+        || get_public_export_hash(&object_name.to_ascii_lowercase()) != public_export_hash
+    {
+        return None;
+    }
+
+    let package = ResolvedZenImport {
+        class_package: CORE_OBJECT_PACKAGE_NAME.to_string(),
+        class_name: PACKAGE_CLASS_NAME.to_string(),
+        object_name: package_name.to_string(),
+        outer: None,
+    };
+    Some(ResolvedZenImport {
+        class_package: CORE_OBJECT_PACKAGE_NAME.to_string(),
+        class_name: OBJECT_CLASS_NAME.to_string(),
+        object_name: object_name.to_string(),
+        outer: Some(Box::new(package)),
+    })
+}
+
 fn resolve_package_import_internal_new(
     package_cache: &FZenPackageContext,
     package_header: &FZenPackageHeader,
@@ -592,13 +634,33 @@ fn resolve_package_import_internal_new(
     let public_export_hash: u64 = package_header.imported_public_export_hashes
         [package_import.imported_public_export_hash_index as usize];
 
-    // Resolve the imported package, and abort if we cannot resolve it
-    let resolved_import_package = package_cache.lookup(package_id)?;
+    let expected_imported_package_name = package_header
+        .imported_package_names
+        .get(package_import.imported_package_index as usize);
+
+    // Resolve the imported package when it is available. Mod extraction often has only a
+    // selected subset of the base-game containers, so preserve a verifiable top-level asset
+    // import from the package name and public export hash when the dependency is unavailable.
+    let resolved_import_package = match package_cache.lookup(package_id) {
+        Ok(package) => package,
+        Err(error) => {
+            if let Some(inferred) = expected_imported_package_name.and_then(|package_name| {
+                infer_top_level_package_import(package_name, public_export_hash)
+            }) {
+                verbose!(
+                    package_cache.log,
+                    "Preserving unresolved top-level import {} from package metadata: {}",
+                    import,
+                    expected_imported_package_name.unwrap()
+                );
+                return Ok(inferred);
+            }
+            return Err(error);
+        }
+    };
 
     // Sanity check - if we have imported package names, this package name must match the imported package name
-    if !package_header.imported_package_names.is_empty() {
-        let expected_imported_package_name =
-            &package_header.imported_package_names[package_import.imported_package_index as usize];
+    if let Some(expected_imported_package_name) = expected_imported_package_name {
         let actual_imported_package_name = resolved_import_package.package_name();
         if *expected_imported_package_name != actual_imported_package_name {
             bail!("Imported package name mismatch: Expected to resolve imported package {}, but resolved {}", *expected_imported_package_name, actual_imported_package_name);
@@ -609,15 +671,21 @@ fn resolve_package_import_internal_new(
     let imported_export = resolved_import_package
         .export_map
         .iter()
-        .find(|x| x.is_public_export() && x.public_export_hash == public_export_hash)
-        .ok_or_else(|| {
-            anyhow!(
-                "Failed to resolve public export with hash {} on package {} (imported by {})",
-                public_export_hash,
-                resolved_import_package.package_name(),
-                package_header.package_name()
-            )
-        })?;
+        .find(|x| x.is_public_export() && x.public_export_hash == public_export_hash);
+
+    let Some(imported_export) = imported_export else {
+        if let Some(inferred) = expected_imported_package_name.and_then(|package_name| {
+            infer_top_level_package_import(package_name, public_export_hash)
+        }) {
+            return Ok(inferred);
+        }
+        return Err(anyhow!(
+            "Failed to resolve public export with hash {} on package {} (imported by {})",
+            public_export_hash,
+            resolved_import_package.package_name(),
+            package_header.package_name()
+        ));
+    };
 
     resolve_package_export_internal(
         package_cache,
@@ -1900,16 +1968,18 @@ fn serialize_asset(builder: &LegacyAssetBuilder) -> anyhow::Result<FSerializedAs
         builder.package_id,
         EIoChunkType::BulkData,
     )?;
-    let optional_bulk_data_buffer = read_bulk_by_package_path(
+    let optional_bulk_data_buffer = read_bulk_by_package_id_with_path_fallback(
         builder.package_context,
         builder.source_store_access,
         builder.package_id,
+        EIoChunkType::OptionalBulkData,
         ".uptnl",
     )?;
-    let memory_mapped_bulk_data_buffer = read_bulk_by_package_path(
+    let memory_mapped_bulk_data_buffer = read_bulk_by_package_id_with_path_fallback(
         builder.package_context,
         builder.source_store_access,
         builder.package_id,
+        EIoChunkType::MemoryMappedBulkData,
         ".m.ubulk",
     )?;
 
@@ -1996,4 +2066,20 @@ pub(crate) fn build_legacy(
     // Write the asset to the file
     write_asset(&asset_builder, out_path, file_writer)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infers_top_level_import_only_when_public_hash_matches_package_leaf() {
+        let package_name = "/Game/Marvel/Characters/1055/1055300/Materials/MI_1055300_Body_01";
+        let hash = get_public_export_hash("mi_1055300_body_01");
+        let inferred = infer_top_level_package_import(package_name, hash).unwrap();
+
+        assert_eq!(inferred.object_name, "MI_1055300_Body_01");
+        assert_eq!(inferred.outer.unwrap().object_name, package_name);
+        assert!(infer_top_level_package_import(package_name, hash ^ 1).is_none());
+    }
 }

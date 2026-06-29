@@ -1,8 +1,9 @@
 use crate::container_header::{EIoContainerHeaderVersion, StoreEntry};
 use crate::iostore_writer::IoStoreWriter;
 use crate::legacy_asset::{
-    convert_localized_package_name_to_source, get_package_object_full_name, EPackageFlags,
-    FLegacyPackageFileSummary, FLegacyPackageHeader, FPackageNameMap, FSerializedAssetBundle,
+    convert_localized_package_name_to_source, get_package_object_full_name, get_public_export_hash,
+    EPackageFlags, FLegacyPackageFileSummary, FLegacyPackageHeader, FPackageNameMap,
+    FSerializedAssetBundle,
 };
 use crate::logging::{emit_log, log, Log};
 use crate::name_map::{EMappedNameType, FNameMap};
@@ -26,16 +27,6 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::sync::{Arc, RwLock};
 use zstd::bulk;
-
-/// NOTE: assumes leading slash is already stripped
-fn get_public_export_hash(package_relative_export_path: &str) -> u64 {
-    cityhasher::hash(
-        package_relative_export_path
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<u8>>(),
-    )
-}
 
 #[derive(Debug, Clone, Default)]
 struct ZenLegacyPackageExternalArcFixupData {
@@ -78,6 +69,16 @@ fn find_skeletal_mesh_export(legacy_package: &FLegacyPackageHeader) -> Option<us
 
 fn find_material_tag_user_data_export(legacy_package: &FLegacyPackageHeader) -> Option<usize> {
     for (export_idx, export) in legacy_package.exports.iter().enumerate() {
+        let object_name = legacy_package.name_map.get(export.object_name);
+        // to-legacy remaps the removed MaterialTagAssetUserData class to AssetUserData,
+        // but deliberately preserves the export object name. Use that stable name when
+        // repacking so the slot tags survive a Retoc round trip.
+        if object_name == "MaterialTagAssetUserData"
+            || object_name.starts_with("MaterialTagAssetUserData_")
+        {
+            return Some(export_idx);
+        }
+
         let class_index = export.class_index;
         if class_index.is_import() {
             let import_idx = class_index.to_import_index() as usize;
@@ -500,10 +501,7 @@ fn patch_skeletal_mesh_materials(
         }
     };
 
-    if matches!(
-        material_array.layout,
-        MaterialArrayLayout::PaddedEmpty | MaterialArrayLayout::PaddedTagged
-    ) {
+    if material_array.layout == MaterialArrayLayout::PaddedTagged {
         emit_log(&format!(
             "[MaterialTags] {} - Skipping (prepatched, {} material(s))",
             package_name, material_array.count
@@ -514,13 +512,17 @@ fn patch_skeletal_mesh_materials(
     let mut new_data = Vec::new();
     let mut total_injected_tags = 0usize;
     let mut tagged_materials = 0usize;
-    let materials_end =
-        material_array.offset + material_array.count * LEGACY_SKELETAL_MATERIAL_SIZE;
+    let source_stride = match material_array.layout {
+        MaterialArrayLayout::Legacy => LEGACY_SKELETAL_MATERIAL_SIZE,
+        MaterialArrayLayout::PaddedEmpty => EMPTY_TAG_SKELETAL_MATERIAL_SIZE,
+        MaterialArrayLayout::PaddedTagged => unreachable!(),
+    };
+    let materials_end = material_array.offset + material_array.count * source_stride;
 
     new_data.extend_from_slice(&export_data[..material_array.offset]);
 
     for material_index in 0..material_array.count {
-        let entry_offset = material_array.offset + material_index * LEGACY_SKELETAL_MATERIAL_SIZE;
+        let entry_offset = material_array.offset + material_index * source_stride;
         let entry_end = entry_offset + LEGACY_SKELETAL_MATERIAL_SIZE;
         new_data.extend_from_slice(&export_data[entry_offset..entry_end]);
 
@@ -1192,10 +1194,21 @@ fn setup_zen_package_summary(
 
     builder.zen_package.bulk_data = match ubulk_size {
         Some(ubulk_size) if !builder.legacy_package.data_resources.is_empty() => {
+            // DataResource offsets are relative to the file that owns the payload. Only
+            // resources actually stored in .ubulk can be validated against ubulk_size;
+            // optional and inline resources point into .uptnl and .uexp respectively.
+            const BULKDATA_FORCE_INLINE_PAYLOAD: u32 = 0x40;
+            const BULKDATA_PAYLOAD_IN_SEPARATE_FILE: u32 = 0x100;
+            const BULKDATA_OPTIONAL_PAYLOAD: u32 = 0x800;
             let entries_valid = builder
                 .legacy_package
                 .data_resources
                 .iter()
+                .filter(|r| {
+                    r.legacy_bulk_data_flags & BULKDATA_PAYLOAD_IN_SEPARATE_FILE != 0
+                        && r.legacy_bulk_data_flags & BULKDATA_OPTIONAL_PAYLOAD == 0
+                        && r.legacy_bulk_data_flags & BULKDATA_FORCE_INLINE_PAYLOAD == 0
+                })
                 .all(|r| r.serial_offset + r.serial_size <= ubulk_size as i64);
 
             if entries_valid {
@@ -2530,6 +2543,56 @@ mod test {
     use crate::zen::EUnrealEngineObjectUE5Version;
     use crate::EIoStoreTocVersion;
     use fs_err as fs;
+
+    fn padded_empty_material(package_index: i32, slot_name_index: i32) -> Vec<u8> {
+        let mut material = Vec::new();
+        material.extend_from_slice(&package_index.to_le_bytes());
+        material.extend_from_slice(&slot_name_index.to_le_bytes());
+        material.extend_from_slice(&0i32.to_le_bytes());
+        material.extend_from_slice(&slot_name_index.to_le_bytes());
+        material.extend_from_slice(&0i32.to_le_bytes());
+        material.extend_from_slice(&[0u8; 20]);
+        material.extend_from_slice(&0i32.to_le_bytes());
+        material
+    }
+
+    #[test]
+    fn injects_tags_into_existing_empty_material_containers() {
+        let name_map = FPackageNameMap::create_from_names(vec![
+            "None".to_string(),
+            "SlotA".to_string(),
+            "SlotB".to_string(),
+            "MaterialTag.Glasses".to_string(),
+        ]);
+        let tag_data = vec![
+            MaterialSlotTagData {
+                slot_name: "SlotA".to_string(),
+                tag_names: vec!["MaterialTag.Glasses".to_string()],
+            },
+            MaterialSlotTagData {
+                slot_name: "SlotB".to_string(),
+                tag_names: Vec::new(),
+            },
+        ];
+
+        let mut export_data = vec![0u8; 4];
+        export_data.extend_from_slice(&2i32.to_le_bytes());
+        export_data.extend_from_slice(&padded_empty_material(-1, 1));
+        export_data.extend_from_slice(&padded_empty_material(-2, 2));
+        let original_len = export_data.len();
+
+        assert!(patch_skeletal_mesh_materials(
+            &mut export_data,
+            &name_map,
+            &tag_data,
+            "/Game/TestMesh",
+        ));
+        assert_eq!(export_data.len(), original_len + 8);
+        assert_eq!(read_i32_at(&export_data, 48), Some(1));
+        assert_eq!(read_i32_at(&export_data, 52), Some(3));
+        assert_eq!(read_i32_at(&export_data, 56), Some(0));
+        assert_eq!(read_i32_at(&export_data, 100), Some(0));
+    }
 
     #[test]
     fn test_zen_asset_identity_conversion() -> anyhow::Result<()> {

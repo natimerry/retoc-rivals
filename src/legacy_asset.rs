@@ -1337,6 +1337,16 @@ pub(crate) fn get_package_object_full_name(
     (package_name, full_object_name)
 }
 
+/// Hashes a lower-case, package-relative export path without its leading slash.
+pub(crate) fn get_public_export_hash(package_relative_export_path: &str) -> u64 {
+    cityhasher::hash(
+        package_relative_export_path
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<u8>>(),
+    )
+}
+
 // Attempts to resolve an original package name from a localized package name. Returns None if the provided package name is not a localized package name. Returns source package name and culture name otherwise
 pub(crate) fn convert_localized_package_name_to_source(
     package_name: &str,
