@@ -336,6 +336,8 @@ mod test {
             UEPathBuf::new(),
             None,
             false,
+            None,
+            None,
         )?;
 
         let (buf_names, buf_name_hashes) = write_name_batch_parts(&names.copy_raw_names())?;

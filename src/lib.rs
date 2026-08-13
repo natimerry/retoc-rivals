@@ -863,6 +863,8 @@ fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
         manifest.mount_point.into(),
         args.compression,
         false,
+        None,
+        None,
     )?;
     for entry in args.input.join("chunks").read_dir()? {
         let entry = entry?;
@@ -1370,6 +1372,8 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         mount_point.into(),
         args.compression,
         args.obfuscate,
+        config.write_encryption_key_guid,
+        config.write_aes_key.clone(),
     )?;
 
     let log = Log::new(args.verbose, args.debug);
@@ -1740,6 +1744,8 @@ fn read_file_opt<P: AsRef<Path>>(path: P) -> Result<Option<Vec<u8>>> {
 
 pub struct Config {
     pub aes_keys: HashMap<FGuid, AesKey>,
+    pub write_encryption_key_guid: Option<FGuid>,
+    pub write_aes_key: Option<AesKey>,
     pub container_header_version_override: Option<EIoContainerHeaderVersion>,
     pub port_kawaii_physics: bool,
     pub kawaii_physics_usmap: Option<PathBuf>,
@@ -1752,6 +1758,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             aes_keys: HashMap::new(),
+            write_encryption_key_guid: None,
+            write_aes_key: None,
             container_header_version_override: None,
             port_kawaii_physics: false,
             kawaii_physics_usmap: None,
@@ -1965,9 +1973,13 @@ fn read_directory_index<R: Read>(
             return Ok(buf);
         }
         let key = config
-            .aes_keys
-            .get(&header.encryption_key_guid)
-            .context("missing encryption key")?;
+            .aes_key(&header.encryption_key_guid)
+            .with_context(|| {
+                format!(
+                    "missing encryption key for IoStore directory index GUID {}",
+                    header.encryption_key_guid
+                )
+            })?;
         for block in buf.chunks_mut(16) {
             key.0.decrypt_block(block.into());
         }
@@ -2061,7 +2073,6 @@ impl Toc {
     pub(crate) fn set_obfuscated(&mut self, obfuscated: bool) {
         if obfuscated {
             self.container_flags |= EIoContainerFlags::Encrypted;
-            self.encryption_key_guid = Default::default();
         } else {
             self.container_flags.remove(EIoContainerFlags::Encrypted);
         }
@@ -2301,8 +2312,7 @@ impl Toc {
         let aes_key = if self.container_flags.contains(EIoContainerFlags::Encrypted) {
             Some(
                 self.config
-                    .aes_keys
-                    .get(&self.encryption_key_guid)
+                    .aes_key(&self.encryption_key_guid)
                     .with_context(|| {
                         format!(
                             "container is encrypted but no AES key for {:?} supplied",
@@ -2783,6 +2793,54 @@ pub struct FGuid {
     c: u32,
     d: u32,
 }
+
+impl FromStr for FGuid {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        let value = value
+            .strip_prefix('{')
+            .and_then(|value| value.strip_suffix('}'))
+            .unwrap_or(value);
+        let value = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .unwrap_or(value);
+        let digits = value.replace('-', "");
+        anyhow::ensure!(
+            digits.len() == 32 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "GUID must contain exactly 32 hexadecimal digits"
+        );
+
+        let parse_word = |start| u32::from_str_radix(&digits[start..start + 8], 16);
+        Ok(Self {
+            a: parse_word(0)?,
+            b: parse_word(8)?,
+            c: parse_word(16)?,
+            d: parse_word(24)?,
+        })
+    }
+}
+
+impl Config {
+    fn aes_key(&self, guid: &FGuid) -> Option<&AesKey> {
+        self.aes_keys
+            .get(guid)
+            .or_else(|| self.aes_keys.get(&FGuid::default()))
+    }
+}
+
+impl Display for FGuid {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:08X}{:08X}{:08X}{:08X}",
+            self.a, self.b, self.c, self.d
+        )
+    }
+}
+
 impl Readable for FGuid {
     fn de<S: Read>(stream: &mut S) -> Result<Self> {
         Ok(Self {

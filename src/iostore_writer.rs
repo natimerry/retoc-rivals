@@ -11,7 +11,6 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use fs_err as fs;
-use std::str::FromStr;
 use std::{
     io::{BufWriter, Seek, Write},
     path::{Path, PathBuf},
@@ -25,6 +24,7 @@ pub(crate) struct IoStoreWriter {
     container_header: Option<FIoContainerHeader>,
     compression: Option<CompressionMethod>,
     obfuscated: bool,
+    aes_key: Option<AesKey>,
 }
 
 impl IoStoreWriter {
@@ -40,6 +40,8 @@ impl IoStoreWriter {
         mount_point: UEPathBuf,
         compression: Option<CompressionMethod>,
         obfuscated: bool,
+        encryption_key_guid: Option<crate::FGuid>,
+        aes_key: Option<AesKey>,
     ) -> Result<Self> {
         let toc_path = toc_path.as_ref().to_path_buf();
         let name = toc_path.file_stem().unwrap().to_string_lossy();
@@ -52,6 +54,9 @@ impl IoStoreWriter {
         toc.container_id = FIoContainerId::from_name(&name);
         toc.directory_index.mount_point = mount_point;
         toc.partition_size = u64::MAX;
+        if let Some(guid) = encryption_key_guid {
+            toc.encryption_key_guid = guid;
+        }
 
         if obfuscated {
             toc.set_obfuscated(true);
@@ -73,6 +78,7 @@ impl IoStoreWriter {
             container_header,
             compression,
             obfuscated,
+            aes_key,
         })
     }
     pub(crate) fn write_chunk_raw(
@@ -152,7 +158,13 @@ impl IoStoreWriter {
                 use aes::cipher::BlockEncrypt;
                 const DEFAULT_AES_KEY: &str =
                     "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74";
-                let key: AesKey = DEFAULT_AES_KEY.parse()?;
+                let default_key;
+                let key = if let Some(key) = self.aes_key.as_ref() {
+                    key
+                } else {
+                    default_key = DEFAULT_AES_KEY.parse()?;
+                    &default_key
+                };
                 let padded_len = (bytes_to_write.len() + 15) & !15;
                 let mut padded = bytes_to_write;
                 padded.resize(padded_len, 0u8);
@@ -281,6 +293,8 @@ mod test {
             "../../..".into(),
             None,
             false,
+            None,
+            None,
         )?;
 
         let data = fs::read("tests/UE5.3/ScriptObjects.bin")?;
@@ -292,6 +306,61 @@ mod test {
             &data,
         )?;
         writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
+    fn writes_custom_guid_and_aes_key() -> Result<()> {
+        use aes::cipher::BlockEncrypt;
+
+        let output_dir =
+            std::env::temp_dir().join(format!("retoc-iostore-crypto-{}", std::process::id()));
+        fs::create_dir_all(&output_dir)?;
+        let utoc = output_dir.join("custom.utoc");
+        let guid: crate::FGuid = "4D4F44534D415256454C4B4559303031".parse()?;
+        let key: AesKey =
+            "0102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F20".parse()?;
+        let mut writer = IoStoreWriter::new(
+            &utoc,
+            EIoStoreTocVersion::PerfectHashWithOverflow,
+            None,
+            "../../..".into(),
+            None,
+            true,
+            Some(guid),
+            Some(key.clone()),
+        )?;
+        let plaintext = [0x5Au8; 16];
+        writer.write_chunk_raw(
+            FIoChunkIdRaw {
+                id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5],
+            },
+            None,
+            &plaintext,
+        )?;
+        writer.finalize()?;
+
+        let mut utoc_reader = std::io::BufReader::new(fs::File::open(&utoc)?);
+        let header: crate::FIoStoreTocHeader = utoc_reader.de()?;
+        assert_eq!(header.encryption_key_guid, guid);
+
+        let mut expected = plaintext;
+        key.0.encrypt_block((&mut expected).into());
+        assert_eq!(fs::read(utoc.with_extension("ucas"))?, expected);
+
+        fs::remove_dir_all(output_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn default_aes_key_applies_to_any_input_guid() -> Result<()> {
+        let mut config = crate::Config::default();
+        config.aes_keys.insert(
+            crate::FGuid::default(),
+            "0C263D8C22DCB085894899C3A3796383E9BF9DE0CBFB08C9BF2DEF2E84F29D74".parse()?,
+        );
+        let arbitrary_guid = "0123456789ABCDEFFEDCBA9876543210".parse()?;
+        assert!(config.aes_key(&arbitrary_guid).is_some());
         Ok(())
     }
 }
