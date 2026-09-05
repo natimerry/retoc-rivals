@@ -1769,84 +1769,150 @@ fn create_unknown_object_import_map_entry(
     }
 }
 
-fn finalize_asset(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
-    // Remap import map to the current indices
-    let import_map_size = max(
-        builder.legacy_package.imports.len(),
-        builder.zen_package.import_map.len(),
-    );
-    let mut import_remap_map: HashMap<usize, usize> = HashMap::with_capacity(import_map_size);
-    let mut new_import_map: Vec<FObjectImport> = Vec::with_capacity(import_map_size);
+#[derive(Debug, PartialEq, Eq)]
+struct ImportReorderPlan {
+    import_order: Vec<Option<usize>>,
+    import_remap: HashMap<usize, usize>,
+}
 
+fn build_import_reorder_plan(
+    current_import_count: usize,
+    zen_import_count: usize,
+    original_import_order: &HashMap<usize, usize>,
+) -> anyhow::Result<ImportReorderPlan> {
     let current_import_indices_with_predefined_positions: HashSet<usize> =
-        builder.original_import_order.values().copied().collect();
-    let mut current_legacy_asset_import_index: usize = 0;
+        original_import_order.values().copied().collect();
 
-    for final_import_index in 0..import_map_size {
-        // If there is an original import to put in this position, use it
-        if let Some(existing_import_position) =
-            builder.original_import_order.get(&final_import_index)
-        {
-            import_remap_map.insert(*existing_import_position, final_import_index);
-            new_import_map.push(builder.legacy_package.imports[*existing_import_position].clone());
-            continue;
+    for (&final_import_index, &current_import_index) in original_import_order {
+        if final_import_index >= zen_import_count {
+            bail!(
+                "Original import position {} is outside the Zen import map with {} entries",
+                final_import_index,
+                zen_import_count
+            );
         }
-        // Skip over the current imports that have predefined positions
-        while current_import_indices_with_predefined_positions
-            .contains(&current_legacy_asset_import_index)
-        {
-            current_legacy_asset_import_index += 1;
+        if current_import_index >= current_import_count {
+            bail!(
+                "Resolved import position {} is outside the temporary import map with {} entries",
+                current_import_index,
+                current_import_count
+            );
         }
-        // We should never end up with fewer imports than we have to fill the holes, since zen never strips non-upackage exports
-        if current_legacy_asset_import_index >= builder.legacy_package.imports.len() {
-            // Attempt to handle this case gracefully by emitting a null import map entry. This allows us not to fail on extracting packages that might load fine otherwise (albeit with information loss)
-            // Log the warning regardless though because the information is lost
-            if !builder.has_failed_import_map_entries {
-                log!(builder.package_context.log, "Failed to find import map entry to fill the hole at {} while filling import map up to size {} for package {}. Null import map entry will be used instead",
-                    final_import_index, import_map_size, builder.legacy_package.summary.package_name.clone());
-            }
+    }
 
-            // We need a new import map entry here, and since it's not referenced by the original package, it can be a package entry, which will become Null again if asset is converted back to zen
-            new_import_map.push(create_unknown_package_import_map_entry(builder));
-            continue;
+    let duplicate_predefined_import_count = original_import_order
+        .len()
+        .saturating_sub(current_import_indices_with_predefined_positions.len());
+    let import_map_capacity = current_import_count
+        .checked_add(duplicate_predefined_import_count)
+        .map(|count| max(count, zen_import_count))
+        .ok_or_else(|| anyhow!("Import map size overflow while rebuilding Zen import positions"))?;
+    let mut import_order = Vec::with_capacity(import_map_capacity);
+    let mut import_remap = HashMap::with_capacity(current_import_count);
+    let mut remaining_imports = (0..current_import_count)
+        .filter(|index| !current_import_indices_with_predefined_positions.contains(index));
+
+    // Preserve the entire original Zen import-map region. Duplicate Zen entries deliberately
+    // duplicate their resolved legacy import, while null slots can hold supplemental imports.
+    for final_import_index in 0..zen_import_count {
+        if let Some(&current_import_index) = original_import_order.get(&final_import_index) {
+            import_remap.insert(current_import_index, final_import_index);
+            import_order.push(Some(current_import_index));
+        } else if let Some(current_import_index) = remaining_imports.next() {
+            import_remap.insert(current_import_index, final_import_index);
+            import_order.push(Some(current_import_index));
+        } else {
+            import_order.push(None);
         }
-
-        // Take the current position and increment it by one
-        let existing_import_position = current_legacy_asset_import_index;
-        current_legacy_asset_import_index += 1;
-
-        import_remap_map.insert(existing_import_position, final_import_index);
-        new_import_map.push(builder.legacy_package.imports[existing_import_position].clone());
     }
-    builder.legacy_package.imports = new_import_map;
 
-    // Remap existing references to the imports in the import and export maps
-    let remap_package_index = |package_index: FPackageIndex| -> FPackageIndex {
-        if package_index.is_import() {
-            let new_import_index = *import_remap_map
-                .get(&(package_index.to_import_index() as usize))
-                .unwrap();
-            return FPackageIndex::create_import(new_import_index as u32);
-        }
-        package_index
-    };
+    // Imports discovered while resolving exports, pre-stream dependencies, or outer chains can
+    // outnumber the available null Zen slots. Keep all of them instead of truncating the tail.
+    for current_import_index in remaining_imports {
+        let final_import_index = import_order.len();
+        import_remap.insert(current_import_index, final_import_index);
+        import_order.push(Some(current_import_index));
+    }
 
-    for x in builder.legacy_package.exports.iter_mut() {
-        x.class_index = remap_package_index(x.class_index);
-        x.super_index = remap_package_index(x.super_index);
-        x.template_index = remap_package_index(x.template_index);
-        x.outer_index = remap_package_index(x.outer_index);
+    if import_remap.len() != current_import_count {
+        bail!(
+            "Failed to preserve every temporary import while rebuilding the import map: mapped {} of {} entries",
+            import_remap.len(),
+            current_import_count
+        );
     }
-    for x in builder.legacy_package.imports.iter_mut() {
-        x.outer_index = remap_package_index(x.outer_index)
+
+    Ok(ImportReorderPlan {
+        import_order,
+        import_remap,
+    })
+}
+
+fn remap_package_index(
+    package_index: FPackageIndex,
+    import_remap: &HashMap<usize, usize>,
+    package_name: &str,
+) -> anyhow::Result<FPackageIndex> {
+    if !package_index.is_import() {
+        return Ok(package_index);
     }
-    for x in builder.legacy_package.data_resources.iter_mut() {
-        x.outer_index = remap_package_index(x.outer_index)
+
+    let current_import_index = package_index.to_import_index() as usize;
+    let new_import_index = import_remap.get(&current_import_index).ok_or_else(|| {
+        anyhow!(
+            "Import {} referenced by package {} was not preserved while rebuilding its import map",
+            current_import_index,
+            package_name
+        )
+    })?;
+    Ok(FPackageIndex::create_import(*new_import_index as u32))
+}
+
+fn remap_legacy_import_references(
+    legacy_package: &mut FLegacyPackageHeader,
+    import_remap: &HashMap<usize, usize>,
+) -> anyhow::Result<()> {
+    let package_name = legacy_package.summary.package_name.clone();
+    let remap_package_index =
+        |package_index| remap_package_index(package_index, import_remap, &package_name);
+
+    for export in legacy_package.exports.iter_mut() {
+        export.class_index = remap_package_index(export.class_index)?;
+        export.super_index = remap_package_index(export.super_index)?;
+        export.template_index = remap_package_index(export.template_index)?;
+        export.outer_index = remap_package_index(export.outer_index)?;
     }
-    for x in builder.legacy_package.preload_dependencies.iter_mut() {
-        *x = remap_package_index(*x);
+    for import in legacy_package.imports.iter_mut() {
+        import.outer_index = remap_package_index(import.outer_index)?;
+    }
+    for data_resource in legacy_package.data_resources.iter_mut() {
+        data_resource.outer_index = remap_package_index(data_resource.outer_index)?;
+    }
+    for preload_dependency in legacy_package.preload_dependencies.iter_mut() {
+        *preload_dependency = remap_package_index(*preload_dependency)?;
     }
     Ok(())
+}
+
+fn finalize_asset(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
+    let reorder_plan = build_import_reorder_plan(
+        builder.legacy_package.imports.len(),
+        builder.zen_package.import_map.len(),
+        &builder.original_import_order,
+    )?;
+    let current_imports = std::mem::take(&mut builder.legacy_package.imports);
+    let mut new_import_map = Vec::with_capacity(reorder_plan.import_order.len());
+
+    for current_import_index in reorder_plan.import_order {
+        if let Some(current_import_index) = current_import_index {
+            new_import_map.push(current_imports[current_import_index].clone());
+        } else {
+            // A null Zen slot with no supplemental import still needs a valid legacy placeholder.
+            new_import_map.push(create_unknown_package_import_map_entry(builder));
+        }
+    }
+    builder.legacy_package.imports = new_import_map;
+    remap_legacy_import_references(&mut builder.legacy_package, &reorder_plan.import_remap)
 }
 
 // Builds an asset from zen container, returns a builder that can be used to write the payload to the file or read it directly
@@ -2072,6 +2138,10 @@ pub(crate) fn build_legacy(
 mod tests {
     use super::*;
 
+    fn import_positions(entries: &[(usize, usize)]) -> HashMap<usize, usize> {
+        entries.iter().copied().collect()
+    }
+
     #[test]
     fn infers_top_level_import_only_when_public_hash_matches_package_leaf() {
         let package_name = "/Game/Marvel/Characters/1055/1055300/Materials/MI_1055300_Body_01";
@@ -2081,5 +2151,124 @@ mod tests {
         assert_eq!(inferred.object_name, "MI_1055300_Body_01");
         assert_eq!(inferred.outer.unwrap().object_name, package_name);
         assert!(infer_top_level_package_import(package_name, hash ^ 1).is_none());
+    }
+
+    #[test]
+    fn import_reorder_preserves_duplicates_and_supplemental_imports() {
+        let plan =
+            build_import_reorder_plan(4, 3, &import_positions(&[(0, 0), (1, 0), (2, 1)])).unwrap();
+
+        assert_eq!(
+            plan.import_order,
+            vec![Some(0), Some(0), Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(plan.import_remap.len(), 4);
+        assert_eq!(plan.import_remap[&0], 1);
+        assert_eq!(plan.import_remap[&1], 2);
+        assert_eq!(plan.import_remap[&2], 3);
+        assert_eq!(plan.import_remap[&3], 4);
+    }
+
+    #[test]
+    fn import_reorder_uses_null_slots_before_appending_imports() {
+        let plan = build_import_reorder_plan(3, 4, &import_positions(&[(0, 0), (2, 1)])).unwrap();
+
+        assert_eq!(plan.import_order, vec![Some(0), Some(2), Some(1), None]);
+        assert_eq!(plan.import_remap[&0], 0);
+        assert_eq!(plan.import_remap[&1], 2);
+        assert_eq!(plan.import_remap[&2], 1);
+    }
+
+    #[test]
+    fn import_reorder_keeps_one_to_one_order_unchanged() {
+        let plan = build_import_reorder_plan(2, 2, &import_positions(&[(0, 0), (1, 1)])).unwrap();
+
+        assert_eq!(plan.import_order, vec![Some(0), Some(1)]);
+        assert_eq!(plan.import_remap, import_positions(&[(0, 0), (1, 1)]));
+    }
+
+    #[test]
+    fn import_reorder_handles_multiple_duplicate_slots() {
+        let plan =
+            build_import_reorder_plan(3, 4, &import_positions(&[(0, 0), (1, 0), (2, 0), (3, 1)]))
+                .unwrap();
+
+        assert_eq!(
+            plan.import_order,
+            vec![Some(0), Some(0), Some(0), Some(1), Some(2)]
+        );
+        assert_eq!(plan.import_remap.len(), 3);
+    }
+
+    #[test]
+    fn remaps_all_legacy_import_reference_locations() {
+        let mut package = FLegacyPackageHeader {
+            imports: vec![
+                FObjectImport::default(),
+                FObjectImport::default(),
+                FObjectImport {
+                    outer_index: FPackageIndex::create_import(2),
+                    ..FObjectImport::default()
+                },
+            ],
+            exports: vec![FObjectExport {
+                class_index: FPackageIndex::create_import(0),
+                super_index: FPackageIndex::create_import(1),
+                template_index: FPackageIndex::create_import(2),
+                outer_index: FPackageIndex::create_import(0),
+                ..FObjectExport::default()
+            }],
+            data_resources: vec![FObjectDataResource {
+                outer_index: FPackageIndex::create_import(1),
+                ..FObjectDataResource::default()
+            }],
+            preload_dependencies: vec![FPackageIndex::create_import(0)],
+            ..FLegacyPackageHeader::default()
+        };
+        let remap = import_positions(&[(0, 4), (1, 3), (2, 5)]);
+
+        remap_legacy_import_references(&mut package, &remap).unwrap();
+
+        assert_eq!(
+            package.exports[0].class_index,
+            FPackageIndex::create_import(4)
+        );
+        assert_eq!(
+            package.exports[0].super_index,
+            FPackageIndex::create_import(3)
+        );
+        assert_eq!(
+            package.exports[0].template_index,
+            FPackageIndex::create_import(5)
+        );
+        assert_eq!(
+            package.exports[0].outer_index,
+            FPackageIndex::create_import(4)
+        );
+        assert_eq!(
+            package.imports[2].outer_index,
+            FPackageIndex::create_import(5)
+        );
+        assert_eq!(
+            package.data_resources[0].outer_index,
+            FPackageIndex::create_import(3)
+        );
+        assert_eq!(
+            package.preload_dependencies[0],
+            FPackageIndex::create_import(4)
+        );
+    }
+
+    #[test]
+    fn missing_import_remap_returns_contextual_error() {
+        let error = remap_package_index(
+            FPackageIndex::create_import(7),
+            &HashMap::new(),
+            "/Game/TestAsset",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Import 7"));
+        assert!(error.to_string().contains("/Game/TestAsset"));
     }
 }

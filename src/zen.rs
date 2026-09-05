@@ -320,6 +320,30 @@ impl Writeable for FBulkDataMapEntry {
     }
 }
 
+fn checked_bulk_data_entry_count(bulk_data_map_size: i64, available_bytes: u64) -> Result<usize> {
+    let bulk_data_map_size = u64::try_from(bulk_data_map_size)
+        .map_err(|_| anyhow!("Negative bulk data map size: {bulk_data_map_size}"))?;
+    let entry_size = size_of::<FBulkDataMapEntry>() as u64;
+
+    if bulk_data_map_size % entry_size != 0 {
+        bail!(
+            "Bulk data map size {} is not aligned to its {}-byte entry size",
+            bulk_data_map_size,
+            entry_size
+        );
+    }
+    if bulk_data_map_size > available_bytes {
+        bail!(
+            "Bulk data map size {} exceeds the {} bytes remaining in the package header section",
+            bulk_data_map_size,
+            available_bytes
+        );
+    }
+
+    usize::try_from(bulk_data_map_size / entry_size)
+        .map_err(|_| anyhow!("Bulk data entry count does not fit in memory on this platform"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromRepr)]
 #[repr(u8)]
 pub(crate) enum EExportFilterFlags {
@@ -863,17 +887,44 @@ impl FZenPackageHeader {
         };
 
         let bulk_data: Vec<FBulkDataMapEntry> = if has_bulk_data {
+            let bulk_data_section_end = package_start_offset
+                .checked_add(
+                    u64::try_from(summary.imported_public_export_hashes_offset).map_err(|_| {
+                        anyhow!(
+                            "Invalid imported public export hashes offset {}",
+                            summary.imported_public_export_hashes_offset
+                        )
+                    })?,
+                )
+                .ok_or_else(|| anyhow!("Bulk data section offset overflow"))?;
+
             // In 5.4+, there is padding before the bulk data map size
             if versioning_info.package_file_version.file_version_ue5
                 >= EUnrealEngineObjectUE5Version::PropertyTagCompleteTypeName as i32
             {
                 let bulk_data_padding: u64 = s.de()?;
+                let padding_start = s.stream_position()?;
+                let available_padding = bulk_data_section_end
+                    .checked_sub(padding_start)
+                    .ok_or_else(|| anyhow!("Bulk data padding starts beyond its header section"))?;
+                if bulk_data_padding > available_padding {
+                    bail!(
+                        "Bulk data padding {} exceeds the {} bytes remaining in the package header section",
+                        bulk_data_padding,
+                        available_padding
+                    );
+                }
                 for _ in 0..bulk_data_padding {
                     let _padding: u8 = s.de()?;
                 }
             }
             let bulk_data_map_size: i64 = s.de()?;
-            let bulk_data_count = bulk_data_map_size as usize / size_of::<FBulkDataMapEntry>();
+            let bulk_data_start = s.stream_position()?;
+            let available_bulk_data_bytes = bulk_data_section_end
+                .checked_sub(bulk_data_start)
+                .ok_or_else(|| anyhow!("Bulk data map starts beyond its header section"))?;
+            let bulk_data_count =
+                checked_bulk_data_entry_count(bulk_data_map_size, available_bulk_data_bytes)?;
             s.de_ctx(bulk_data_count)?
         } else {
             vec![]
@@ -1317,6 +1368,32 @@ mod test {
     use anyhow::Context as _;
     use fs_err as fs;
     use std::{io::BufReader, path::Path};
+
+    #[test]
+    fn validates_bulk_data_map_size_before_allocation() {
+        let entry_size = size_of::<FBulkDataMapEntry>() as i64;
+
+        assert_eq!(
+            checked_bulk_data_entry_count(entry_size * 2, (entry_size * 2) as u64).unwrap(),
+            2
+        );
+        assert!(checked_bulk_data_entry_count(-1, entry_size as u64)
+            .unwrap_err()
+            .to_string()
+            .contains("Negative"));
+        assert!(
+            checked_bulk_data_entry_count(entry_size + 1, (entry_size + 1) as u64)
+                .unwrap_err()
+                .to_string()
+                .contains("not aligned")
+        );
+        assert!(
+            checked_bulk_data_entry_count(entry_size * 2, entry_size as u64)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+    }
 
     #[test]
     fn test_zen_asset_parsing() -> Result<()> {
