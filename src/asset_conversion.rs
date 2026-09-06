@@ -39,11 +39,12 @@ pub(crate) struct FZenPackageContext<'a> {
 #[derive(Default)]
 struct FZenPackageContextMutableState {
     package_headers_cache: HashMap<FPackageId, Arc<FZenPackageHeader>>,
+    public_export_indices: HashMap<FPackageId, HashMap<u64, usize>>,
     packages_failed_load: HashSet<FPackageId>,
     has_logged_detected_package_version: bool,
 }
 struct FZenPackageContextScriptObjects {
-    script_objects: ZenScriptObjects,
+    script_objects: Arc<ZenScriptObjects>,
     script_objects_resolved_as_classes: HashSet<FPackageObjectIndex>,
 }
 impl<'a> FZenPackageContext<'a> {
@@ -64,7 +65,7 @@ impl<'a> FZenPackageContext<'a> {
     }
     fn get_script_objects(
         &self,
-    ) -> anyhow::Result<RwLockReadGuard<Option<FZenPackageContextScriptObjects>>> {
+    ) -> anyhow::Result<RwLockReadGuard<'_, Option<FZenPackageContextScriptObjects>>> {
         let read_lock = self.script_objects.read().unwrap();
         if read_lock.is_some() {
             Ok(read_lock)
@@ -219,6 +220,14 @@ impl<'a> FZenPackageContext<'a> {
         // Move the package header into a shared pointer and store it into the map
         let shared_package_header: Arc<FZenPackageHeader> = Arc::new(zen_package_header?);
         let mut write_lock = self.inner_state.write().unwrap();
+        let mut export_indices = HashMap::new();
+        for (index, export) in shared_package_header.export_map.iter().enumerate() {
+            if export.is_public_export() {
+                // Match the former linear search's first-match behavior.
+                export_indices.entry(export.public_export_hash).or_insert(index);
+            }
+        }
+        write_lock.public_export_indices.insert(package_id, export_indices);
         write_lock
             .package_headers_cache
             .insert(package_id, shared_package_header.clone());
@@ -229,11 +238,7 @@ impl<'a> FZenPackageContext<'a> {
         &self,
         package_id: FPackageId,
         store_access: &dyn IoStoreTrait,
-    ) -> anyhow::Result<Arc<FZenPackageHeader>> {
-        if std::ptr::addr_eq(store_access, self.store_access) {
-            return self.lookup(package_id);
-        }
-
+    ) -> anyhow::Result<(Arc<FZenPackageHeader>, Vec<u8>)> {
         let redirected_package_id = store_access
             .lookup_package_redirect(package_id)
             .unwrap_or(package_id);
@@ -260,28 +265,16 @@ impl<'a> FZenPackageContext<'a> {
             .or_else(|| self.store_access.container_header_version())
             .ok_or_else(|| anyhow!("Failed to retrieve container header version"))?;
 
-        Ok(Arc::new(FZenPackageHeader::deserialize(
+        let header = Arc::new(FZenPackageHeader::deserialize(
             &mut zen_package_buffer,
             Some(package_store_entry_ref),
             container_version,
             container_header_version,
             self.fallback_package_file_version,
-        )?))
+        )?);
+        Ok((header, zen_package_buffer.into_inner()))
     }
 
-    fn read_full_package_data_from_store(
-        &self,
-        package_id: FPackageId,
-        store_access: &dyn IoStoreTrait,
-    ) -> anyhow::Result<Vec<u8>> {
-        let redirected_package_id = store_access
-            .lookup_package_redirect(package_id)
-            .unwrap_or(package_id);
-
-        let package_chunk_id =
-            FIoChunkId::from_package_id(redirected_package_id, 0, EIoChunkType::ExportBundleData);
-        store_access.read(package_chunk_id)
-    }
 }
 
 fn looks_like_bare_leaf_package_name(name: &str) -> bool {
@@ -668,10 +661,9 @@ fn resolve_package_import_internal_new(
     }
 
     // Resolve the export that we are interested in. Note that the package passed to the resolve_package_export_internal must be the imported package, not this package
-    let imported_export = resolved_import_package
-        .export_map
-        .iter()
-        .find(|x| x.is_public_export() && x.public_export_hash == public_export_hash);
+    let export_index = package_cache.inner_state.read().unwrap().public_export_indices
+        .get(&package_id).and_then(|indices| indices.get(&public_export_hash)).copied();
+    let imported_export = export_index.map(|index| &resolved_import_package.export_map[index]);
 
     let Some(imported_export) = imported_export else {
         if let Some(inferred) = expected_imported_package_name.and_then(|package_name| {
@@ -813,6 +805,8 @@ fn resolve_generic_zen_import_import(
 }
 
 struct LegacyAssetBuilder<'a, 'b> {
+    // Retain the decoded source only for this active conversion, not the whole mod.
+    raw_package_data: Vec<u8>,
     package_context: &'a FZenPackageContext<'b>,
     source_store_access: &'a dyn IoStoreTrait,
     package_id: FPackageId,
@@ -835,10 +829,11 @@ fn create_asset_builder<'a, 'b>(
     source_store_access: Option<&'a dyn IoStoreTrait>,
 ) -> anyhow::Result<LegacyAssetBuilder<'a, 'b>> {
     let source_store_access = source_store_access.unwrap_or(package_context.store_access);
-    let zen_package: Arc<FZenPackageHeader> =
+    let (zen_package, raw_package_data) =
         package_context.load_package_from_store(package_id, source_store_access)?;
     drop(package_context.get_script_objects()?);
     Ok(LegacyAssetBuilder {
+        raw_package_data,
         package_context,
         source_store_access,
         package_id,
@@ -2018,12 +2013,10 @@ fn serialize_asset(builder: &LegacyAssetBuilder) -> anyhow::Result<FSerializedAs
     )?;
 
     // Copy the raw export data from the chunk into the exports file
-    let raw_exports_data = builder
-        .package_context
-        .read_full_package_data_from_store(builder.package_id, builder.source_store_access)?;
+    let raw_exports_data = &builder.raw_package_data;
     let exports_file_buffer = if builder.needs_to_rebuild_exports_data {
         // If we need to rebuild export data, do it now
-        rebuild_asset_export_data_internal(builder, &raw_exports_data)?
+        rebuild_asset_export_data_internal(builder, raw_exports_data)?
     } else {
         // Otherwise we just need to strip the zen header from the exports
         raw_exports_data[builder.zen_package.summary.header_size as usize..].to_vec()

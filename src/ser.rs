@@ -2,7 +2,6 @@ use std::{io::Read, io::Write};
 
 use anyhow::Result;
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
-use tracing::instrument;
 
 pub(crate) trait Readable {
     fn de<S: Read>(stream: &mut S) -> Result<Self>
@@ -45,14 +44,12 @@ pub(crate) trait ReadableCtx<C> {
 
 impl<T> ReadExt for T where T: Read {}
 pub(crate) trait ReadExt: Read {
-    #[instrument(skip_all)]
     fn de<T: Readable>(&mut self) -> Result<T>
     where
         Self: Sized,
     {
         T::de(self)
     }
-    #[instrument(skip_all)]
     fn de_ctx<T: ReadableCtx<C>, C>(&mut self, ctx: C) -> Result<T>
     where
         Self: Sized,
@@ -62,7 +59,6 @@ pub(crate) trait ReadExt: Read {
 }
 impl<T> WriteExt for T where T: Write {}
 pub(crate) trait WriteExt: Write {
-    #[instrument(skip_all)]
     fn ser<T: Writeable>(&mut self, value: &T) -> Result<()>
     where
         Self: Sized,
@@ -70,7 +66,6 @@ pub(crate) trait WriteExt: Write {
         value.ser(self)
     }
     /// Serialize &[T] without length prefix
-    #[instrument(skip_all)]
     fn ser_no_length<T: Writeable, S: AsRef<[T]>>(&mut self, value: &S) -> Result<()>
     where
         Self: Sized,
@@ -80,7 +75,6 @@ pub(crate) trait WriteExt: Write {
 }
 
 impl<const N: usize, T: Readable + Default + Copy> Readable for [T; N] {
-    #[instrument(skip_all, name = "read_fixed_slice")]
     fn de<S: Read>(stream: &mut S) -> Result<Self> {
         T::de_array(stream)
     }
@@ -237,7 +231,6 @@ impl Writeable for i64 {
     }
 }
 
-#[instrument(skip_all)]
 pub(crate) fn read_array<S: Read, T, F>(len: usize, stream: &mut S, mut f: F) -> Result<Vec<T>>
 where
     F: FnMut(&mut S) -> Result<T>,
@@ -249,7 +242,6 @@ where
     Ok(array)
 }
 
-#[instrument(skip_all)]
 pub(crate) fn read_string<S: Read>(len: i32, stream: &mut S) -> Result<String> {
     if len < 0 {
         let chars = read_array((-len) as usize, stream, |r| Ok(r.read_u16::<LE>()?))?;

@@ -26,7 +26,6 @@ use std::cmp::{max, Ordering};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::sync::{Arc, RwLock};
-use zstd::bulk;
 
 #[derive(Debug, Clone, Default)]
 struct ZenLegacyPackageExternalArcFixupData {
@@ -187,7 +186,7 @@ fn parse_material_slot_tags_from_binary(
                 break;
             }
 
-            let value_size = i32::from_le_bytes([
+            let _value_size = i32::from_le_bytes([
                 export_data[offset],
                 export_data[offset + 1],
                 export_data[offset + 2],
@@ -229,7 +228,7 @@ fn parse_material_slot_tags_from_binary(
             offset += 4;
 
             if !is_ue5 && offset + 4 <= data_len {
-                let inner_name_idx = i32::from_le_bytes([
+                let _inner_name_idx = i32::from_le_bytes([
                     export_data[offset],
                     export_data[offset + 1],
                     export_data[offset + 2],
@@ -256,7 +255,7 @@ fn parse_material_slot_tags_from_binary(
                 ]) as i32;
                 offset += 4;
 
-                let struct_name_idx = i32::from_le_bytes([
+                let _struct_name_idx = i32::from_le_bytes([
                     export_data[offset],
                     export_data[offset + 1],
                     export_data[offset + 2],

@@ -185,7 +185,7 @@ fn main() {
     }
 
     println!(
-        "cargo:warning=Built KawaiiPhysicsBinding managed DLL at {} ({})",
+        "cargo:metadata=binding_build=Built KawaiiPhysicsBinding managed DLL at {} ({})",
         binding_assembly.display(),
         if self_contained {
             "self-contained"
@@ -195,7 +195,7 @@ fn main() {
     );
 
     println!(
-        "cargo:warning=Embedded KawaiiPhysicsBinding managed DLL artifacts via {}",
+        "cargo:metadata=binding_embed=Embedded KawaiiPhysicsBinding managed DLL artifacts via {}",
         embed_rs.display()
     );
 }

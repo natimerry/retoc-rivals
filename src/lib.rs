@@ -5,6 +5,8 @@ mod container_header;
 mod file_pool;
 mod iostore;
 mod iostore_writer;
+mod iostore_repack;
+pub use iostore_repack::{repack_iostore, DirectRepackUnsupported, IoStoreRepackStats};
 mod kawaii_physics;
 mod legacy_asset;
 mod logging;
@@ -22,7 +24,8 @@ use anyhow::{bail, Context, Result};
 use bitflags::bitflags;
 use clap::Parser;
 use compression::{decompress, CompressionMethod};
-use container_header::StoreEntry;
+pub use container_header::StoreEntry;
+pub use script_objects::ZenScriptObjects;
 use file_pool::FilePool;
 use fs_err as fs;
 use iostore::{IoStoreTrait, PackageInfo};
@@ -463,14 +466,14 @@ struct Args {
     action: Action,
 }
 
-fn main() -> Result<()> {
+/// Run the retained standalone command-line dispatcher.
+pub fn cli_main() -> Result<()> {
     let args = Args::parse();
 
     let mut config = Config {
         container_header_version_override: args.override_container_header_version,
         ..Default::default()
     };
-    println!("Using aes key: {:?}", &args.aes_key);
     if let Some(aes) = args.aes_key.clone() {
         config
             .aes_keys
@@ -478,10 +481,9 @@ fn main() -> Result<()> {
     }
     let config = Arc::new(config);
 
-    let aes = AesKey::from_str(&args.aes_key.unwrap().clone()).unwrap().0;
     match args.action {
         Action::Manifest(action) => {
-            action_manifest(action, config);
+            action_manifest(action, config)?;
             Ok(())
         }
         Action::Info(action) => action_info(action, config),
@@ -504,7 +506,7 @@ fn main() -> Result<()> {
 pub fn action_manifest(
     args: ActionManifest,
     config: Arc<Config>,
-) -> Result<(PackageStoreManifest)> {
+) -> Result<PackageStoreManifest> {
     let iostore = iostore::open(args.utoc, config)?;
 
     let entries = Arc::new(Mutex::new(vec![]));
@@ -565,7 +567,7 @@ pub fn action_manifest(
         oplog: manifest::OpLog { entries },
     };
 
-    return Ok((manifest));
+    Ok(manifest)
 }
 
 fn action_info(args: ActionInfo, config: Arc<Config>) -> Result<()> {
@@ -2099,14 +2101,9 @@ impl ReadableCtx<Arc<Config>> for Toc {
         let chunk_metas = read_meta(stream, &header)?;
 
         // build indexes
-        let mut chunk_id_to_index: HashMap<FIoChunkId, u32> = Default::default();
-        for (chunk_index, &chunk_id) in chunk_ids.iter().enumerate() {
-            chunk_id_to_index.insert(chunk_id, chunk_index as u32);
-        }
-
-        let mut file_map: HashMap<String, u32> = Default::default();
-        let mut file_map_lower: HashMap<String, u32> = Default::default();
-        let mut file_map_rev: HashMap<u32, String> = Default::default();
+        let mut file_map: HashMap<String, u32> = HashMap::with_capacity(chunk_ids.len());
+        let mut file_map_lower: HashMap<String, u32> = HashMap::with_capacity(chunk_ids.len());
+        let mut file_map_rev: HashMap<u32, String> = HashMap::with_capacity(chunk_ids.len());
         let directory_index = if !directory_index.is_empty() {
             FIoDirectoryIndexResource::de(&mut Cursor::new(directory_index))?
         } else {
@@ -2388,7 +2385,7 @@ impl Toc {
 #[derive(
     Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
-struct FPackageId(u64);
+pub struct FPackageId(u64);
 impl Readable for FPackageId {
     fn de<S: Read>(s: &mut S) -> Result<Self> {
         Ok(Self(s.de()?))
@@ -2739,7 +2736,7 @@ impl FIoStoreTocCompressedBlockEntry {
         self.data[11] = value;
     }
 }
-struct FIoChunkHash([u8; 32]);
+pub struct FIoChunkHash([u8; 32]);
 impl FIoChunkHash {
     fn from_blake3(hash: &[u8; 32]) -> FIoChunkHash {
         let mut data = [0; 32];

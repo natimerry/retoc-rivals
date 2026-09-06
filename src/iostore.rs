@@ -1,10 +1,10 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     ffi::OsStr,
     io::{BufReader, Cursor},
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Instant, SystemTime},
 };
 
 use anyhow::{bail, Context, Result};
@@ -105,17 +105,20 @@ pub trait IoStoreTrait: Send + Sync {
     fn read_raw(&self, chunk_id_raw: FIoChunkIdRaw) -> Result<Vec<u8>>;
     fn has_chunk_id(&self, chunk_id: FIoChunkId) -> bool;
     fn has_chunk_id_raw(&self, chunk_id_raw: FIoChunkIdRaw) -> bool;
-    fn chunks(&self) -> Box<dyn Iterator<Item = ChunkInfo> + Send + '_>;
-    fn chunks_all(&self) -> Box<dyn Iterator<Item = ChunkInfo> + Send + '_>;
-    fn packages(&self) -> Box<dyn Iterator<Item = PackageInfo> + Send + '_>;
-    fn packages_all(&self) -> Box<dyn Iterator<Item = PackageInfo> + Send + '_>;
+    fn chunks(&self) -> Box<dyn Iterator<Item = ChunkInfo<'_>> + Send + '_>;
+    fn chunks_all(&self) -> Box<dyn Iterator<Item = ChunkInfo<'_>> + Send + '_>;
+    fn packages(&self) -> Box<dyn Iterator<Item = PackageInfo<'_>> + Send + '_>;
+    fn packages_all(&self) -> Box<dyn Iterator<Item = PackageInfo<'_>> + Send + '_>;
     fn child_containers(&self) -> Box<dyn Iterator<Item = &dyn IoStoreTrait> + '_>;
     /// Get absolute path (including mount point) if it has one
     fn chunk_path(&self, chunk_id: FIoChunkId) -> Option<String>;
     fn package_store_entry(&self, package_id: FPackageId) -> Option<StoreEntry>;
     fn lookup_package_redirect(&self, source_package_id: FPackageId) -> Option<FPackageId>;
 
-    fn load_script_objects(&self) -> Result<ZenScriptObjects> {
+    fn load_script_objects(&self) -> Result<Arc<ZenScriptObjects>> {
+        Ok(Arc::new(self.load_script_objects_uncached()?))
+    }
+    fn load_script_objects_uncached(&self) -> Result<ZenScriptObjects> {
         if self.container_file_version().unwrap() > EIoStoreTocVersion::PerfectHash {
             let script_objects_data =
                 self.read(FIoChunkId::create(0, 0, EIoChunkType::ScriptObjects))?;
@@ -268,6 +271,14 @@ impl IoStoreBackend {
     }
 }
 impl IoStoreTrait for IoStoreBackend {
+    fn load_script_objects(&self) -> Result<Arc<ZenScriptObjects>> {
+        if self.container_file_version().is_some_and(|v| v > EIoStoreTocVersion::PerfectHash) {
+            let id = FIoChunkId::create(0, 0, EIoChunkType::ScriptObjects);
+            return self.containers.iter().find(|c| c.has_chunk_id(id))
+                .context("ScriptObjects not found in any containers")?.load_script_objects();
+        }
+        Ok(Arc::new(self.load_script_objects_uncached()?))
+    }
     fn container_name(&self) -> &str {
         "VIRTUAL"
     }
@@ -318,18 +329,18 @@ impl IoStoreTrait for IoStoreBackend {
             .iter()
             .any(|c| c.has_chunk_id_raw(chunk_id_raw))
     }
-    fn chunks(&self) -> Box<dyn Iterator<Item = ChunkInfo> + Send + '_> {
+    fn chunks(&self) -> Box<dyn Iterator<Item = ChunkInfo<'_>> + Send + '_> {
         Box::new(UniqueIterator::new(self.chunks_all()))
     }
-    fn chunks_all(&self) -> Box<dyn Iterator<Item = ChunkInfo> + Send + '_> {
+    fn chunks_all(&self) -> Box<dyn Iterator<Item = ChunkInfo<'_>> + Send + '_> {
         Box::new(self.containers.iter().flat_map(|c| c.chunks_all()))
     }
-    fn packages(&self) -> Box<dyn Iterator<Item = PackageInfo> + Send + '_> {
+    fn packages(&self) -> Box<dyn Iterator<Item = PackageInfo<'_>> + Send + '_> {
         Box::new(UniqueIterator::new(
             self.containers.iter().flat_map(|c| c.packages()),
         ))
     }
-    fn packages_all(&self) -> Box<dyn Iterator<Item = PackageInfo> + Send + '_> {
+    fn packages_all(&self) -> Box<dyn Iterator<Item = PackageInfo<'_>> + Send + '_> {
         Box::new(self.containers.iter().flat_map(|c| c.packages_all()))
     }
     fn child_containers(&self) -> Box<dyn Iterator<Item = &dyn IoStoreTrait> + '_> {
@@ -350,17 +361,80 @@ impl IoStoreTrait for IoStoreBackend {
     }
 }
 
+// Keep only game metadata, never open file handles or decompressed asset payloads.
+// Two entries cover global + character for the common mod workflow. File stamps
+// and the read configuration prevent reuse after game updates or AES changes.
+#[derive(PartialEq, Eq)]
+struct MetadataCacheKey {
+    path: PathBuf,
+    toc_stamp: (u64, SystemTime),
+    cas_stamp: (u64, SystemTime),
+    read_config: [u8; 32],
+}
+struct MetadataCacheEntry {
+    key: MetadataCacheKey,
+    toc: Arc<Toc>,
+    header: Option<Arc<FIoContainerHeader>>,
+    script_objects: Arc<OnceLock<Arc<ZenScriptObjects>>>,
+}
+static METADATA_CACHE: OnceLock<Mutex<VecDeque<MetadataCacheEntry>>> = OnceLock::new();
+
+fn metadata_cache_key(path: &Path, config: &Config) -> Option<MetadataCacheKey> {
+    use aes::cipher::BlockEncrypt;
+    let name = path.file_stem()?.to_str()?.to_ascii_lowercase();
+    if name != "global" && !name.starts_with("pakchunk") { return None; }
+    let stamp = |p: &Path| {
+        let m = std::fs::metadata(p).ok()?;
+        Some((m.len(), m.modified().ok()?))
+    };
+    let mut entries = config.aes_keys.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(guid, _)| **guid);
+    let mut hash = blake3::Hasher::new();
+    hash.update(format!("{:?}", config.container_header_version_override).as_bytes());
+    for (guid, key) in entries {
+        hash.update(guid.to_string().as_bytes());
+        let mut block = aes::Block::default();
+        key.0.encrypt_block(&mut block);
+        hash.update(&block);
+    }
+    Some(MetadataCacheKey {
+        path: std::fs::canonicalize(path).ok()?,
+        toc_stamp: stamp(path)?,
+        cas_stamp: stamp(&path.with_extension("ucas"))?,
+        read_config: *hash.finalize().as_bytes(),
+    })
+}
+
 pub struct IoStoreContainer {
     name: String,
     path: PathBuf,
-    toc: Toc,
+    toc: Arc<Toc>,
     cas: FilePool,
 
-    container_header: Option<FIoContainerHeader>,
+    container_header: Option<Arc<FIoContainerHeader>>,
+    script_objects: Arc<OnceLock<Arc<ZenScriptObjects>>>,
 }
 impl IoStoreContainer {
     pub fn open<P: AsRef<Path>>(toc_path: P, config: Arc<Config>) -> Result<Self> {
         let path = toc_path.as_ref().to_path_buf();
+        let cache_key = metadata_cache_key(&path, &config);
+        if let Some(key) = &cache_key {
+            let mut cache = METADATA_CACHE.get_or_init(Default::default).lock().unwrap();
+            if let Some(index) = cache.iter().position(|entry| &entry.key == key) {
+                let entry = cache.remove(index).unwrap();
+                let toc = entry.toc.clone();
+                let container_header = entry.header.clone();
+                let script_objects = entry.script_objects.clone();
+                cache.push_back(entry);
+                drop(cache);
+                emit_log(&format!("Reusing game container metadata: {}", path.display()));
+                return Ok(Self {
+                    name: path.file_stem().context("missing container name")?.to_string_lossy().into(),
+                    cas: FilePool::new(path.with_extension("ucas"), rayon::max_num_threads())?,
+                    path, toc, container_header, script_objects,
+                });
+            }
+        }
         let open_start = Instant::now();
         let phase_start = Instant::now();
         let toc: Toc = BufReader::new(fs::File::open(&path)?).de_ctx(config.clone())?;
@@ -388,10 +462,11 @@ impl IoStoreContainer {
                 .to_string_lossy()
                 .into(),
             path,
-            toc,
+            toc: Arc::new(toc),
             cas,
 
             container_header: None,
+            script_objects: Default::default(),
         };
 
         // TODO avoid linear search for header
@@ -432,7 +507,7 @@ impl IoStoreContainer {
                         packages = header.package_ids().count(),
                         "Deserialized IoStore ContainerHeader"
                     );
-                    container.container_header = Some(header);
+                    container.container_header = Some(Arc::new(header));
                 }
                 Err(err) => {
                     emit_log(&format!("Failed to parse ContainerHeader ({chunk_id:?}). Package metadata will be unavailable: {err:?}"));
@@ -446,6 +521,18 @@ impl IoStoreContainer {
             "Finished opening IoStore container"
         );
 
+        if let Some(key) = cache_key {
+            // Do not cache a file that changed while it was being parsed.
+            if metadata_cache_key(&container.path, &config).as_ref() == Some(&key) {
+                let mut cache = METADATA_CACHE.get_or_init(Default::default).lock().unwrap();
+                cache.retain(|entry| entry.key.path != key.path);
+                while cache.len() >= 2 { cache.pop_front(); }
+                cache.push_back(MetadataCacheEntry {
+                    key, toc: container.toc.clone(), header: container.container_header.clone(),
+                    script_objects: container.script_objects.clone(),
+                });
+            }
+        }
         Ok(container)
     }
     pub fn container_path(&self) -> &Path {
@@ -453,6 +540,12 @@ impl IoStoreContainer {
     }
 }
 impl IoStoreTrait for IoStoreContainer {
+    fn load_script_objects(&self) -> Result<Arc<ZenScriptObjects>> {
+        if let Some(objects) = self.script_objects.get() { return Ok(objects.clone()); }
+        let objects = Arc::new(self.load_script_objects_uncached()?);
+        let _ = self.script_objects.set(objects.clone());
+        Ok(objects)
+    }
     fn container_name(&self) -> &str {
         &self.name
     }
@@ -507,21 +600,21 @@ impl IoStoreTrait for IoStoreContainer {
     fn has_chunk_id_raw(&self, chunk_id_raw: FIoChunkIdRaw) -> bool {
         self.has_chunk_id(FIoChunkId::from_raw(chunk_id_raw, self.toc.version))
     }
-    fn chunks(&self) -> Box<dyn Iterator<Item = ChunkInfo> + Send + '_> {
+    fn chunks(&self) -> Box<dyn Iterator<Item = ChunkInfo<'_>> + Send + '_> {
         // chunks should already be unique in individual containers
         self.chunks_all()
     }
-    fn chunks_all(&self) -> Box<dyn Iterator<Item = ChunkInfo> + Send + '_> {
+    fn chunks_all(&self) -> Box<dyn Iterator<Item = ChunkInfo<'_>> + Send + '_> {
         Box::new(self.toc.chunks.iter().map(|&id| ChunkInfo {
             id,
             container: self,
         }))
     }
-    fn packages(&self) -> Box<dyn Iterator<Item = PackageInfo> + Send + '_> {
+    fn packages(&self) -> Box<dyn Iterator<Item = PackageInfo<'_>> + Send + '_> {
         // packages should already be unique in individual containers
         self.packages_all()
     }
-    fn packages_all(&self) -> Box<dyn Iterator<Item = PackageInfo> + Send + '_> {
+    fn packages_all(&self) -> Box<dyn Iterator<Item = PackageInfo<'_>> + Send + '_> {
         Box::new(
             self.container_header
                 .iter()
@@ -553,6 +646,29 @@ impl IoStoreTrait for IoStoreContainer {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn game_metadata_cache_reuses_and_invalidates() -> Result<()> {
+        use std::io::Write;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("pakchunkCacheTest.utoc");
+        let writer = crate::iostore_writer::IoStoreWriter::new(&path,
+            EIoStoreTocVersion::PerfectHashWithOverflow, None, "../../../".into(), None, false, None, None)?;
+        writer.finalize()?;
+        let config = Arc::new(Config::default());
+        let first = IoStoreContainer::open(&path, config.clone())?;
+        let second = IoStoreContainer::open(&path, config.clone())?;
+        assert!(Arc::ptr_eq(&first.toc, &second.toc));
+        std::fs::OpenOptions::new().append(true).open(path.with_extension("ucas"))?.write_all(&[0])?;
+        let changed = IoStoreContainer::open(&path, config)?;
+        assert!(!Arc::ptr_eq(&first.toc, &changed.toc));
+        let mut other_config = Config::default();
+        other_config.aes_keys.insert(crate::FGuid::default(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".parse()?);
+        let rekeyed = IoStoreContainer::open(&path, Arc::new(other_config))?;
+        assert!(!Arc::ptr_eq(&changed.toc, &rekeyed.toc));
+        Ok(())
+    }
 
     #[test]
     fn test_sort_container() {

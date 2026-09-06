@@ -14,7 +14,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ZenScriptObjects {
+pub struct ZenScriptObjects {
     pub(crate) global_name_map: FNameMap,
     pub(crate) script_objects: Vec<FScriptObjectEntry>,
     pub(crate) script_object_lookup: HashMap<FPackageObjectIndex, FScriptObjectEntry>,

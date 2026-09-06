@@ -12,7 +12,7 @@ use crate::{
 use anyhow::{Context, Result};
 use fs_err as fs;
 use std::{
-    io::{BufWriter, Seek, Write},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
 
@@ -20,6 +20,7 @@ pub(crate) struct IoStoreWriter {
     toc_path: PathBuf,
     toc_stream: BufWriter<fs::File>,
     cas_stream: BufWriter<fs::File>,
+    cas_offset: u64,
     toc: Toc,
     container_header: Option<FIoContainerHeader>,
     compression: Option<CompressionMethod>,
@@ -30,7 +31,7 @@ pub(crate) struct IoStoreWriter {
 impl IoStoreWriter {
     pub(crate) fn set_obfuscated(&mut self, obfuscated: bool) {
         self.toc.set_obfuscated(obfuscated);
-        self.obfuscated = true;
+        self.obfuscated = obfuscated;
     }
 
     pub(crate) fn new<P: AsRef<Path>>(
@@ -74,6 +75,7 @@ impl IoStoreWriter {
             toc_path,
             toc_stream,
             cas_stream,
+            cas_offset: 0,
             toc,
             container_header,
             compression,
@@ -130,8 +132,7 @@ impl IoStoreWriter {
             index.add_file(relative_path, self.toc.chunks.len() as u32);
         }
 
-        self.cas_stream.flush()?;
-        let mut offset = self.cas_stream.stream_position()?;
+        let mut offset = self.cas_offset;
         let start_block = self.toc.compression_blocks.len();
         let mut hasher = blake3::Hasher::new();
 
@@ -192,7 +193,7 @@ impl IoStoreWriter {
             offset += written_size as u64;
         }
 
-        let logical_offset = start_block as u64 * self.toc.compression_block_size as u64;
+        self.cas_offset = offset;
 
         let hash = hasher.finalize();
         let meta = FIoStoreTocEntryMeta {
@@ -274,6 +275,8 @@ impl IoStoreWriter {
             self.write_chunk_uncompressed(chunk_id, None, &chunk_buffer)?;
         }
         self.toc_stream.ser(&self.toc)?;
+        self.cas_stream.flush()?;
+        self.toc_stream.flush()?;
         Ok(())
     }
 }

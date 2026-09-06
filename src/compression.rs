@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use std::io::{Read as _, Write};
 use strum::{AsRefStr, EnumString, VariantArray};
 
-#[derive(Debug, Clone, Copy, PartialEq, EnumString, AsRefStr, VariantArray)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, AsRefStr, VariantArray)]
 pub enum CompressionMethod {
     Zlib,
     Zstd,

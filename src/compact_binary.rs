@@ -206,7 +206,7 @@ fn read_field<S: Read>(stream: &mut Ctx<S>, mut tag: ECbFieldTypeFlags) -> Resul
                 FieldValue::UniformObject(fields)
             }
             ECbFieldType::Array => {
-                let size = varint::read_var_uint(stream)?;
+                let _size = varint::read_var_uint(stream)?;
                 let count = varint::read_var_uint(stream)?;
                 let mut fields = vec![];
                 for _ in 0..count {
@@ -215,7 +215,7 @@ fn read_field<S: Read>(stream: &mut Ctx<S>, mut tag: ECbFieldTypeFlags) -> Resul
                 FieldValue::Array(fields)
             }
             ECbFieldType::UniformArray => {
-                let size = varint::read_var_uint(stream)?;
+                let _size = varint::read_var_uint(stream)?;
                 let count = varint::read_var_uint(stream)?;
                 let tag: ECbFieldTypeFlags = stream.de()?;
                 let mut fields = vec![];

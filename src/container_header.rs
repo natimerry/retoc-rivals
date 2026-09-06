@@ -413,7 +413,7 @@ impl Writeable for LegacyContainerHeaderPackageRedirect {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct StoreEntry {
+pub struct StoreEntry {
     // version == EIoContainerHeaderVersion::NoExportInfo
     pub(crate) export_bundles_size: u64,
     pub(crate) load_order: u32,
