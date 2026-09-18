@@ -1655,7 +1655,7 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     );
 
     info!(
-        "Ported a total of {} KawaiiPhysics assets",
+        "Ported a total of {} KawaiiPhysics animation nodes",
         total_ported.load(Ordering::Relaxed)
     );
 
