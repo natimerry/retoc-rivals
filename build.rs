@@ -11,11 +11,41 @@ const STAMP_FILE_NAME: &str = ".retoc-kawaii-binding.stamp";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RETOC_SKIP_KAWAII_BINDING_BUILD");
+    println!("cargo:rerun-if-env-changed=RETOC_KAWAII_BINDING_DIR");
     println!("cargo:rerun-if-env-changed=RETOC_KAWAII_BINDING_SELF_CONTAINED");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DOTNET_SELF_CONTAINED");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR was not set"));
     let embed_rs = out_dir.join(EMBED_RS_NAME);
+
+    if let Some(binding_dir) = env::var_os("RETOC_KAWAII_BINDING_DIR") {
+        let binding_dir = PathBuf::from(binding_dir);
+        let target_os = env::var("CARGO_CFG_TARGET_OS").expect("missing CARGO_CFG_TARGET_OS");
+        let binding_executable_name = binding_executable_name(&target_os);
+
+        let publish_files = collect_publish_files(&binding_dir);
+        if publish_files.is_empty() {
+            panic!(
+                "RETOC_KAWAII_BINDING_DIR contains no publish artifacts: {}",
+                binding_dir.display()
+            );
+        }
+        let binding_stamp = binding_stamp(&binding_dir, &publish_files);
+
+        write_embed_file(
+            &embed_rs,
+            &binding_dir,
+            &publish_files,
+            &binding_stamp,
+            false,
+            binding_executable_name,
+        );
+        println!(
+            "cargo:metadata=binding_embed=Embedded KawaiiPhysicsBinding from {}",
+            binding_dir.display()
+        );
+        return;
+    }
 
     if env::var_os("RETOC_SKIP_KAWAII_BINDING_BUILD").is_some() {
         write_empty_embed_file(&embed_rs);
