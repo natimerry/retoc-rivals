@@ -104,6 +104,8 @@ fn main() {
         .arg(&publish_dir)
         .env("DOTNET_CLI_HOME", build_root.join("dotnet_home"))
         .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
+        // Without this, each fresh DOTNET_CLI_HOME adds its tools dir to the user PATH.
+        .env("DOTNET_ADD_GLOBAL_TOOLS_TO_PATH", "0")
         .env("DOTNET_NOLOGO", "1")
         .env("APPDATA", build_root.join("appdata"))
         .env("LOCALAPPDATA", build_root.join("localappdata"))
