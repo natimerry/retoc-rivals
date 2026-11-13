@@ -891,50 +891,30 @@ fn find_skeletal_material_array(
     package_name: &str,
     expected_slot_names: &[&str],
 ) -> Option<MaterialArrayCandidate> {
-    if let Some(candidate) = find_first_material_array_by_layout(
-        export_data,
-        name_map,
-        expected_slot_names,
-        MaterialArrayLayout::PaddedTagged,
-    ) {
-        let has_existing_tags =
-            candidate.byte_len > candidate.count * EMPTY_TAG_SKELETAL_MATERIAL_SIZE;
-        if has_existing_tags {
-            emit_log(&format!(
-                "[MaterialTags] {} - Found prepatched tagged FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)",
-                package_name, candidate.offset, candidate.count, candidate.score
-            ));
-            return Some(candidate);
-        }
-    }
+    let find = |layout| {
+        find_first_material_array_by_layout(export_data, name_map, expected_slot_names, layout)
+    };
+    let tagged = find(MaterialArrayLayout::PaddedTagged).filter(|candidate| {
+        candidate.byte_len > candidate.count * EMPTY_TAG_SKELETAL_MATERIAL_SIZE
+    });
 
-    if let Some(candidate) = find_first_material_array_by_layout(
-        export_data,
-        name_map,
-        expected_slot_names,
-        MaterialArrayLayout::PaddedEmpty,
-    ) {
-        emit_log(&format!(
-            "[MaterialTags] {} - Found prepatched FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)",
-            package_name, candidate.offset, candidate.count, candidate.score
-        ));
-        return Some(candidate);
-    }
+    // The array follows the properties, so the earliest match is the real one: a large mesh's render data can hold
+    // bytes that pass as a short array of any layout. Ties go to the padded readings, listed first, since a
+    // one-entry padded array also reads as a legacy one.
+    let (candidate, description) = [
+        (tagged, "prepatched tagged"),
+        (find(MaterialArrayLayout::PaddedEmpty), "prepatched"),
+        (find(MaterialArrayLayout::Legacy), "legacy"),
+    ]
+    .into_iter()
+    .filter_map(|(candidate, description)| candidate.map(|candidate| (candidate, description)))
+    .min_by_key(|(candidate, _)| candidate.offset)?;
 
-    if let Some(candidate) = find_first_material_array_by_layout(
-        export_data,
-        name_map,
-        expected_slot_names,
-        MaterialArrayLayout::Legacy,
-    ) {
-        emit_log(&format!(
-            "[MaterialTags] {} - Found legacy FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)",
-            package_name, candidate.offset, candidate.count, candidate.score
-        ));
-        return Some(candidate);
-    }
-
-    None
+    emit_log(&format!(
+        "[MaterialTags] {} - Found {} FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)",
+        package_name, description, candidate.offset, candidate.count, candidate.score
+    ));
+    Some(candidate)
 }
 
 fn patch_material_tags(builder: &mut ZenPackageBuilder) -> bool {
@@ -2591,6 +2571,49 @@ mod test {
         assert_eq!(read_i32_at(&export_data, 52), Some(3));
         assert_eq!(read_i32_at(&export_data, 56), Some(0));
         assert_eq!(read_i32_at(&export_data, 100), Some(0));
+    }
+
+    #[test]
+    fn stock_array_wins_over_a_later_lookalike_in_mesh_data() {
+        // A big mesh's vertex data can hold bytes that pass as a one-entry padded array; the real material array
+        // comes right after the properties, so it must be the one patched.
+        let name_map = FPackageNameMap::create_from_names(vec![
+            "None".to_string(),
+            "SlotA".to_string(),
+            "SlotB".to_string(),
+        ]);
+        let legacy_material = |package_index: i32, slot_name_index: i32| {
+            padded_empty_material(package_index, slot_name_index)[..LEGACY_SKELETAL_MATERIAL_SIZE].to_vec()
+        };
+
+        let mut export_data = vec![0u8; 4];
+        export_data.extend_from_slice(&2i32.to_le_bytes());
+        export_data.extend_from_slice(&legacy_material(-1, 1));
+        export_data.extend_from_slice(&legacy_material(-2, 2));
+        export_data.extend_from_slice(&[0xAB; 64]); // stand-in for render data
+        export_data.extend_from_slice(&1i32.to_le_bytes());
+        export_data.extend_from_slice(&padded_empty_material(-3, 1));
+        let original_len = export_data.len();
+
+        assert!(patch_skeletal_mesh_materials(&mut export_data, &name_map, &[], "/Game/TestMesh"));
+        assert_eq!(export_data.len(), original_len + 8);
+        assert_eq!(read_i32_at(&export_data, 48), Some(0)); // first material's new empty tag container
+        assert_eq!(read_i32_at(&export_data, 52), Some(-2)); // second material, shifted by 4
+        assert_eq!(read_i32_at(&export_data, 92), Some(0)); // second material's tag container
+    }
+
+    #[test]
+    fn one_entry_padded_array_is_not_padded_again() {
+        // A one-entry padded array also reads as a legacy one at the same offset.
+        let name_map =
+            FPackageNameMap::create_from_names(vec!["None".to_string(), "SlotA".to_string()]);
+        let mut export_data = vec![0u8; 4];
+        export_data.extend_from_slice(&1i32.to_le_bytes());
+        export_data.extend_from_slice(&padded_empty_material(-1, 1));
+        let original_len = export_data.len();
+
+        patch_skeletal_mesh_materials(&mut export_data, &name_map, &[], "/Game/TestMesh");
+        assert_eq!(export_data.len(), original_len);
     }
 
     #[test]
