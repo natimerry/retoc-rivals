@@ -336,9 +336,12 @@ pub struct ActionToZen {
     /// USMAP used by the Kawaii Physics porter.
     #[arg(long)]
     kawaii_physics_usmap: Option<PathBuf>,
-    /// Rebuild Chains[0] even if chain data already exists.
-    #[arg(long)]
+    /// Rebuild Chains[0] even if chain data already exists (default, matches 3.9.2).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     kawaii_physics_force_rebuild: bool,
+    /// JSON overrides applied while porting Kawaii Physics nodes.
+    #[arg(long)]
+    kawaii_physics_edit_options_json: Option<String>,
     /// Patch LODInfo.DefaultHiddenMaterials via carrier data.
     #[arg(long)]
     patch_default_hidden_materials: bool,
@@ -372,6 +375,7 @@ impl ActionToZen {
             port_kawaii_physics: false,
             kawaii_physics_usmap: None,
             kawaii_physics_force_rebuild: true,
+            kawaii_physics_edit_options_json: None,
             patch_default_hidden_materials: false,
             kawaii_physics_default_hidden_material_bitmaps: Vec::new(),
         }
@@ -380,7 +384,16 @@ impl ActionToZen {
     pub fn with_kawaii_physics_port(mut self, usmap: PathBuf) -> Self {
         self.port_kawaii_physics = true;
         self.kawaii_physics_usmap = Some(usmap);
-        self.kawaii_physics_force_rebuild = true;
+        self
+    }
+
+    pub fn with_kawaii_physics_force_rebuild(mut self, force_rebuild: bool) -> Self {
+        self.kawaii_physics_force_rebuild = force_rebuild;
+        self
+    }
+
+    pub fn with_kawaii_physics_edit_options_json(mut self, options_json: Option<String>) -> Self {
+        self.kawaii_physics_edit_options_json = options_json;
         self
     }
 
@@ -1460,7 +1473,8 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         .kawaii_physics_usmap
         .as_ref()
         .or(config.kawaii_physics_usmap.as_ref());
-    let kawaii_physics_force_rebuild = true;
+    let kawaii_physics_force_rebuild = args.kawaii_physics_force_rebuild;
+    let kawaii_physics_edit_options_json = args.kawaii_physics_edit_options_json.as_deref();
     let default_hidden_material_bitmap_override = if !args
         .kawaii_physics_default_hidden_material_bitmaps
         .is_empty()
@@ -1541,7 +1555,7 @@ pub fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
                         kawaii_physics_force_rebuild,
                         port_kawaii_physics,
                         default_hidden_material_patch_arg.as_deref(),
-                        None,
+                        kawaii_physics_edit_options_json,
                         &total_ported,
                     )?;
                 }
@@ -1765,7 +1779,7 @@ impl Default for Config {
             container_header_version_override: None,
             port_kawaii_physics: false,
             kawaii_physics_usmap: None,
-            kawaii_physics_force_rebuild: true,
+            kawaii_physics_force_rebuild: false,
             patch_default_hidden_materials: false,
             kawaii_physics_default_hidden_material_bitmaps: None,
         }
